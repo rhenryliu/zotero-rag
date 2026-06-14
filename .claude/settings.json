@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git status*)",
+      "Bash(git show*)",
+      "Bash(pdflatex*)",
+      "Bash(xelatex*)",
+      "Bash(lualatex*)",
+      "Bash(bibtex*)",
+      "Bash(biber*)",
+      "Bash(latexmk*)",
+      "Bash(ls*)",
+      "Bash(cat*)",
+      "Bash(grep*)",
+      "Bash(find*)",
+      "Bash(word-count*)",
+      "Bash(wc*)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(git reset --hard*)",
+      "Bash(git rebase*)",
+      "Bash(git commit --amend*)",
+      "Bash(rm -rf*)",
+      "Bash(rm -r*)"
+    ]
+  }
+}

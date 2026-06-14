@@ -155,13 +155,14 @@ GEN_TEMPERATURE = 0.2
 ANTHROPIC_MODEL = "claude-sonnet-4-6"  # used only when GEN_PROVIDER == "anthropic"
 ANTHROPIC_MAX_TOKENS = 2048            # ANTHROPIC_API_KEY must be set in the env
 
-# CBORG (LBNL) is an Anthropic-API-compatible gateway: same Messages API, but
-# bearer-token auth against a custom base URL. Used only when GEN_PROVIDER ==
-# "cborg". The token is read from $CBORG_API_KEY (exported in ~/.zshrc); the
-# model name is a CBORG alias, not a versioned Anthropic id. NOTE: CBORG's
-# support for image content blocks is unverified, so MULTIMODAL may or may not
-# work over this provider.
-CBORG_MODEL = "claude-sonnet"          # CBORG alias (cf. claude-haiku / claude-opus)
+# CBORG (LBNL) is an OpenAI-compatible gateway built on LiteLLM: it exposes the
+# OpenAI chat-completions API (NOT the Anthropic Messages API), with bearer-token
+# auth against a custom base URL. Used only when GEN_PROVIDER == "cborg". The
+# token is read from $CBORG_API_KEY (exported in ~/.zshrc). Model names are
+# provider-prefixed CBORG aliases (e.g. "anthropic/claude-sonnet"), not bare
+# Anthropic ids. NOTE: CBORG's support for image content is unverified, so
+# MULTIMODAL may or may not work over this provider (a warning is printed if used).
+CBORG_MODEL = "anthropic/claude-sonnet"  # provider-prefixed CBORG alias (cf. anthropic/claude-haiku)
 CBORG_MAX_TOKENS = 2048
 CBORG_BASE_URL = "https://api.cborg.lbl.gov"
 
@@ -1077,23 +1078,32 @@ class RAGPipeline:
         )
 
     def _generate_cborg(self, system: str, prompt: str, images: list[bytes], history) -> str:
-        """Generate via CBORG (LBNL), an Anthropic-API-compatible gateway.
+        """Generate via CBORG (LBNL), an OpenAI-compatible LiteLLM gateway.
 
-        Reuses the Messages API path, but authenticates with a bearer token
-        (``$CBORG_API_KEY``) against ``CBORG_BASE_URL`` rather than an Anthropic
-        ``X-Api-Key``. The client is built with explicit ``auth_token`` and
-        ``base_url`` so it does not depend on whatever ``ANTHROPIC_*`` variables
+        CBORG exposes the OpenAI chat-completions API (not the Anthropic Messages
+        API), authenticated with a bearer token (``$CBORG_API_KEY``) against
+        ``CBORG_BASE_URL``. The client is built with explicit ``api_key`` and
+        ``base_url`` so it does not depend on whatever ``OPENAI_*`` variables
         happen to be exported in the shell.
         """
-        import anthropic
+        import openai
 
         token = os.environ.get("CBORG_API_KEY")
         if not token:
             raise RuntimeError(
                 "GEN_PROVIDER='cborg' but $CBORG_API_KEY is not set in the environment."
             )
-        client = anthropic.Anthropic(auth_token=token, base_url=CBORG_BASE_URL)
-        return self._generate_messages_api(
+        if images:
+            # CBORG's handling of image content is unverified; warn loudly rather
+            # than fail silently if MULTIMODAL is routed through this provider.
+            print(
+                "WARNING: MULTIMODAL is on with GEN_PROVIDER='cborg', but CBORG's "
+                "support for image content is UNVERIFIED -- this request may fail or "
+                "silently ignore the attached page images.",
+                file=sys.stderr,
+            )
+        client = openai.OpenAI(api_key=token, base_url=CBORG_BASE_URL)
+        return self._generate_openai_compatible(
             client, CBORG_MODEL, CBORG_MAX_TOKENS, system, prompt, images, history
         )
 
@@ -1107,7 +1117,7 @@ class RAGPipeline:
         images: list[bytes],
         history,
     ) -> str:
-        """Run one Anthropic Messages API call, shared by the anthropic/cborg paths.
+        """Run one Anthropic Messages API call (the ``anthropic`` provider path).
 
         Args:
             client: A configured ``anthropic.Anthropic`` client (auth and base
@@ -1140,10 +1150,62 @@ class RAGPipeline:
         resp = client.messages.create(
             model=model,
             max_tokens=max_tokens,
+            temperature=GEN_TEMPERATURE,
             system=system,
             messages=messages,
         )
         return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+    def _generate_openai_compatible(
+        self,
+        client,
+        model: str,
+        max_tokens: int,
+        system: str,
+        prompt: str,
+        images: list[bytes],
+        history,
+    ) -> str:
+        """Run one OpenAI chat-completions call (the ``cborg`` provider path).
+
+        Args:
+            client: A configured ``openai.OpenAI`` client (api key and base URL
+                already set by the caller).
+            model: Model identifier or gateway alias to generate with.
+            max_tokens: Maximum number of tokens to generate.
+            system: System prompt, sent as a leading ``system`` message.
+            prompt: User prompt text, appended after any image parts.
+            images: Page images as raw PNG bytes, attached as base64 data-URI
+                ``image_url`` parts.
+            history: Prior chat messages (role/content dicts), or None.
+
+        Returns:
+            The response message content, stripped.
+        """
+        if images:
+            parts: list[dict] = [{"type": "text", "text": prompt}]
+            for img in images:
+                data = base64.standard_b64encode(img).decode("ascii")
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{data}"},
+                    }
+                )
+            user_content: object = parts
+        else:
+            user_content = prompt
+        messages: list[dict] = [{"role": "system", "content": system}]
+        if history:
+            messages.extend(history[-MAX_HISTORY_MESSAGES:])
+        messages.append({"role": "user", "content": user_content})
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=GEN_TEMPERATURE,
+            messages=messages,
+        )
+        return (resp.choices[0].message.content or "").strip()
 
     def query(self, question: str, top_k: int = TOP_K) -> str:
         """Answer a single question (no memory).
