@@ -1,0 +1,8 @@
+ollama>=0.4
+lancedb>=0.33.0
+pymupdf>=1.24
+tqdm>=4.66
+numpy>=1.26
+sentence-transformers>=5.0
+transformers>=4.51.0
+anthropic>=0.40
