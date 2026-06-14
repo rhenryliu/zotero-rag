@@ -4,10 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-file (`zotero_rag.py`) local RAG pipeline over a Zotero library: discover PDFs →
-extract → chunk → embed → store in LanceDB → retrieve → rerank → generate a cited answer.
-Everything runs locally by default via Ollama; only the *generation* step can optionally be
-routed to a remote Claude-compatible API. There is no package, no README, and no test suite.
+A local RAG pipeline over a Zotero library, split across two modules: `zotero_rag.py` (the
+pipeline) and `figure_filter.py` (figure-aware page-text extraction, imported by the pipeline).
+Flow: discover PDFs → extract (figure-aware) → chunk across pages → embed → store in LanceDB →
+retrieve → rerank / diversity-select → generate a cited answer. Everything runs locally by
+default via Ollama; only the *generation* step can optionally be routed to a remote
+Claude-compatible API. There is a `README.md`; no package and no test suite.
 
 ## Environment & commands
 
@@ -32,17 +34,22 @@ type hints on all functions (the global conventions apply).
 
 ## Configuration model
 
-All tuning is done by editing the constants in the `=== Configuration ===` block at the top of
-`zotero_rag.py` — there are no config files or env-based settings flags. The intended workflow is
+Almost all tuning is done by editing the constants in the `=== Configuration ===` block at the top
+of `zotero_rag.py` — there are no config files or env-based settings flags. The intended workflow is
 literally a one-line edit:
 
 - `EMBEDDER` — selects from the `EMBEDDERS` dict. **Switching re-ingests** into that embedder's own table.
 - `RERANKER` — selects from `RERANKERS`. Switching needs **no** re-ingest.
 - `GEN_PROVIDER` — `"ollama"` (local) | `"anthropic"` (Claude API) | `"cborg"` (LBNL gateway).
+- `SELECT_DIVERSE` / `MMR_LAMBDA` / `PER_DOC_CAP` — diversity-aware final selection (MMR with a
+  soft per-paper cap). Switching needs **no** re-ingest.
 - `MULTIMODAL` — attach rendered page images to a vision generation model (retrieval stays text-only).
 
 Secrets come from the environment, not code: `ANTHROPIC_API_KEY` for `anthropic`, `CBORG_API_KEY`
 for `cborg`.
+
+Figure-detection tunables (`FIGURE_MIN_AREA_FRAC`, `FIGURE_PAD`, `FIGURE_GRANULARITY`) live at the
+top of `figure_filter.py`, not in `zotero_rag.py`.
 
 ## Architecture invariants (read before editing)
 
@@ -58,12 +65,32 @@ corrupts the index or crashes the embedding runner.
   prefix **only** for instruction-aware (Qwen) embedders. Vectors are truncated to `effective_dim()`
   and L2-normalised, so plain L2 search ranks identically to cosine (no metric is set at search time).
 
-- **Size guard chain.** A chunk larger than the embedding runner's batch crashes it (EOF). Three
-  layers prevent this: `chunk_page` hard-splits over-long paragraphs, table Markdown is `_hard_split`,
-  and `split_oversized_records` is the final net enforcing `MAX_EMBED_CHARS`. Don't loosen these
-  without understanding the crash they prevent.
+- **Figure-aware extraction, table de-dup.** Prose comes from `figure_filter.extract_page_text`,
+  which drops text whose centre lies inside a large graphic region (area-gated by
+  `FIGURE_MIN_AREA_FRAC`, so display equations survive) or inside a detected table's bbox.
+  `extract_pages` calls `find_tables()` ONCE per page and feeds the result to BOTH the Markdown
+  chunk and the prose-exclusion regions; a table whose Markdown is empty is NOT excluded (so no
+  content is dropped without a Markdown replacement). `get_text("dict")` is parsed once per page.
 
-- **Idempotent, crash-safe ingest.** Records use deterministic ids (`<doc_id>:<page>:<idx>`) and are
+- **Cross-page chunking.** Prose is packed across page breaks by `chunk_document`; tables are kept
+  per-page and **never** routed through it (packing would scramble their Markdown). Each chunk
+  carries a `page`/`page_end` span — `page_end` is a schema field, so **changing the chunking
+  requires a full `rebuild`** (there is no in-place migration; `_verify_dim` only guards the vector
+  dim). Citations render `p.N` or `pp.N-M`.
+
+- **Size guard chain.** A chunk larger than the embedding runner's batch crashes it (EOF). Three
+  layers prevent this: `chunk_document` hard-splits over-long paragraphs, table Markdown is
+  `_hard_split`, and `split_oversized_records` is the final net enforcing `MAX_EMBED_CHARS`. Don't
+  loosen these without understanding the crash they prevent.
+
+- **Diversity-aware retrieval.** Candidates are cross-encoder scored ONCE via `_cross_encoder_scores`
+  (shared by `rerank` and the diverse path). With `SELECT_DIVERSE`, `select_diverse` runs greedy MMR
+  with redundancy penalised only WITHIN the same `doc_id` (cross-document corroboration is not
+  penalised) plus a soft `PER_DOC_CAP` two-pass fill. A disabled or failed reranker falls back to
+  vector-search order in every path.
+
+- **Idempotent, crash-safe ingest.** Records use deterministic ids (prose `<doc_id>:c<n>`, tables
+  `<doc_id>:<page>:t<tidx>:<sidx>`) and are
   written with `merge_insert("id")` (upsert), **never** `table.add` (which double-counts on retry).
   The per-embedder manifest of completed `doc_id`s is saved incrementally and in a `finally`, so
   Ctrl-C resumes cleanly. A PDF that errors is left *unmarked* (retried next run); a PDF that opens

@@ -24,11 +24,11 @@ Everything runs locally by default on [Ollama](https://ollama.com). Only the fin
 The pipeline runs in seven stages:
 
 1. **Discovery** — walks `~/Zotero/storage` for PDFs and reads each paper's title/year from `zotero.sqlite` (opened read-only, so it's safe while Zotero is running), falling back to the filename when metadata is missing.
-2. **Extraction** — per-page text via PyMuPDF; tables are also extracted to Markdown.
-3. **Chunking** — overlapping, paragraph-aware chunks (~350 tokens) with per-page provenance, so citations point at exact pages.
+2. **Extraction** — figure-aware per-page text via PyMuPDF: text living inside large figures (axis labels, legends, in-plot annotations) is dropped, while prose, captions, and display equations are kept. Tables are detected once per page, rendered to Markdown, and their region is excluded from the prose so a table isn't also captured as garbled text.
+3. **Chunking** — overlapping, paragraph-aware chunks (~350 tokens) packed *across* page breaks, so an idea that straddles a page boundary stays in one chunk. Each chunk records its page span, so citations point at a single page (`p.N`) or a range (`pp.N-M`).
 4. **Embedding** — chunks become vectors via a selectable Ollama embedding model.
 5. **Storage** — LanceDB, with **one table per embedder** (vectors from different models aren't comparable), keyed by model + dimension.
-6. **Retrieval** — embed the query, pull the 24 nearest chunks, then rerank to the top-k with a cross-encoder.
+6. **Retrieval** — embed the query, pull the 24 nearest chunks, and score them all with a cross-encoder. Selection is **diversity-aware** by default (MMR): it trades relevance against redundancy *within the same paper* and applies a soft per-paper cap, so a single document can't dominate the context — while passages from *different* papers can still corroborate one another. Set `SELECT_DIVERSE=False` for plain top-k rerank ordering.
 7. **Generation** — a grounded answer with inline `[n]` citations, via Ollama or a remote provider. With `MULTIMODAL` enabled, the retrieved pages are rendered and attached so a vision model can read figures and tables directly.
 
 Two query modes are available: a one-shot `query` with no memory, and a conversational `chat` with history-aware query rewriting.
@@ -79,8 +79,8 @@ Local models are served by Ollama and must be pulled once. The reranker is **not
 # Default embedder (verify the exact tag in your Ollama registry first)
 ollama pull qwen3-embedding:0.6b
 
-# Default local generation model (vision-capable; required if you enable MULTIMODAL)
-ollama pull gemma4:26b
+# Default local generation model
+ollama pull qwen3.6:35b
 
 # Query-rewriting model used in chat mode
 ollama pull qwen3.5:9b
@@ -91,6 +91,7 @@ Optional, only if you switch to them in the config:
 ```bash
 ollama pull bge-m3                # alternative embedder
 ollama pull qwen3-embedding:4b    # alternative embedder (2560-dim, higher quality)
+ollama pull gemma4:26b            # vision-capable model, only if you enable MULTIMODAL
 ```
 
 The default reranker `BAAI/bge-reranker-v2-m3` (0.6B params, ~1.1 GB in fp16) downloads from HuggingFace the first time you run a query or chat. The `gte` and `qwen3` reranker alternatives download on demand if selected.
@@ -135,7 +136,7 @@ python zotero_rag.py query "your question" [--top-k N]
 | Option | Default | Description |
 |---|---|---|
 | `question` | — | The question (positional, quote it). |
-| `--top-k` | `6` | Number of reranked chunks used as context. |
+| `--top-k` | `6` | Number of selected chunks used as context. |
 
 If no index exists yet for the active embedder, it ingests first automatically.
 
@@ -184,7 +185,7 @@ python zotero_rag.py rebuild [--yes]
 
 ## Configuration
 
-All knobs live in the config block near the top of `zotero_rag.py`. The most important ones:
+Most knobs live in the config block near the top of `zotero_rag.py` (figure detection is tuned in `figure_filter.py` — see the note below the table). The most important ones:
 
 | Setting | Default | Options / notes |
 |---|---|---|
@@ -195,9 +196,12 @@ All knobs live in the config block near the top of `zotero_rag.py`. The most imp
 | `USE_RERANKER` | `True` | Disable to use raw vector order. |
 | `RERANK_DEVICE` | `mps` | Auto-falls back to CPU on load/predict failure. |
 | `RERANK_CANDIDATES` | `24` | First-stage recall width before reranking. |
-| `TOP_K` | `6` | Chunks passed to the generator. |
+| `TOP_K` | `6` | Chunks selected and passed to the generator. |
+| `SELECT_DIVERSE` | `True` | Diversity-aware final selection (MMR) over the scored candidates. `False` = plain top-k rerank order. |
+| `MMR_LAMBDA` | `0.7` | Relevance vs within-paper redundancy trade-off (`1.0` = pure relevance). |
+| `PER_DOC_CAP` | `3` | Soft cap on chunks selected from any one paper. |
 | `GEN_PROVIDER` | `ollama` | `ollama` (local) \| `anthropic` (Claude API) \| `cborg` (LBNL gateway). |
-| `GEN_MODEL` | `gemma4:26b` | Ollama generation model; must be vision-capable and non-MLX if `MULTIMODAL` is on. |
+| `GEN_MODEL` | `qwen3.6:35b` | Ollama generation model. For `MULTIMODAL` it must be vision-capable and non-MLX (e.g. `gemma4:26b`). |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Used when `GEN_PROVIDER="anthropic"`. |
 | `CBORG_MODEL` | `claude-sonnet` | Cborg alias; used when `GEN_PROVIDER="cborg"`. See [Generation providers](#generation-providers). |
 | `CBORG_BASE_URL` | `https://api.cborg.lbl.gov` | Cborg API endpoint. |
@@ -211,13 +215,15 @@ All knobs live in the config block near the top of `zotero_rag.py`. The most imp
 | `ZOTERO_DIR` | `~/Zotero` | Zotero data directory. |
 | `INDEX_DIR` | `~/.cache/zotero_rag` | Vector index, manifests, and registry. |
 
+A few **figure-detection** tunables live at the top of `figure_filter.py` instead: `FIGURE_MIN_AREA_FRAC` (the area gate that separates figures from display equations), `FIGURE_PAD` (region inflation, in points), and `FIGURE_GRANULARITY` (`"line"` drops only in-figure lines, protecting captions that share a text block with plot annotations; `"block"` drops whole blocks).
+
 ## Generation providers
 
 Set `GEN_PROVIDER` to choose where answers are generated. Embedding and reranking are unaffected — they're always local.
 
 ### `ollama` (default, fully local)
 
-Uses `GEN_MODEL` (default `gemma4:26b`). No API key, no network. This is the only provider that works fully offline.
+Uses `GEN_MODEL` (default `qwen3.6:35b`). No API key, no network. This is the only provider that works fully offline.
 
 ### `anthropic` (Claude API)
 
@@ -282,4 +288,4 @@ Everything lives under `INDEX_DIR` (`~/.cache/zotero_rag`):
 - **Apple Silicon assumed for the reranker.** It runs on MPS with a CPU fallback; other accelerators aren't specially handled.
 - **Ingest is incremental and resumable.** Re-running `ingest` only processes new or previously-failed papers; it won't duplicate existing chunks.
 - **Switching the embedder requires a re-ingest** into that embedder's table (one-time cost). Switching the reranker does not.
-- **One attachment, multiple PDFs.** A document's `doc_id` is its Zotero storage-folder key, and chunk ids are `<doc_id>:<page>:<idx>`. A folder normally holds one PDF, but if it holds several (e.g. supplementary files), the first (sorted) keeps the bare key and the rest get a `<key>__<stem>` suffix, so every PDF is indexed with distinct ids and none overwrites another. Note: if such a folder's first PDF is later removed, the bare key would attach to a different file on the next ingest — delete and rebuild that embedder's table if you reshuffle PDFs within a folder.
+- **One attachment, multiple PDFs.** A document's `doc_id` is its Zotero storage-folder key, and chunk ids are derived from it (`<doc_id>:c<n>` for prose chunks, `<doc_id>:<page>:t<tidx>:<sidx>` for tables). A folder normally holds one PDF, but if it holds several (e.g. supplementary files), the first (sorted) keeps the bare key and the rest get a `<key>__<stem>` suffix, so every PDF is indexed with distinct ids and none overwrites another. Note: if such a folder's first PDF is later removed, the bare key would attach to a different file on the next ingest — delete and rebuild that embedder's table if you reshuffle PDFs within a folder.

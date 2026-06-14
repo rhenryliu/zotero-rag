@@ -7,8 +7,9 @@ run locally, since Claude is not an embedding or reranking model).
 PIPELINE (stage by stage):
     1. Discovery   walk ~/Zotero/storage for PDFs; read titles/years from
                    zotero.sqlite (read-only), falling back to the filename.
-    2. Extraction  text per page with PyMuPDF; tables -> Markdown chunks too.
-    3. Chunking    overlapping ~350-token chunks; per-page -> exact page cites.
+    2. Extraction  figure-aware text per page (PyMuPDF); tables -> Markdown too.
+    3. Chunking    overlapping ~350-token chunks packed across page breaks;
+                   each chunk cites a single page or a page range.
     4. Embedding   chunks -> vectors via an Ollama embedding model (selectable).
     5. Storage     LanceDB, ONE table per embedder (vectors of different models
                    are not comparable), keyed by model+dim.
@@ -72,6 +73,8 @@ import numpy as np
 import ollama
 from lancedb.pydantic import LanceModel, Vector
 from tqdm import tqdm
+
+from figure_filter import extract_page_text
 
 # === Configuration ==========================================================
 
@@ -148,6 +151,14 @@ USE_RERANKER = True
 RERANK_DEVICE = "mps"  # falls back to CPU automatically if MPS load fails
 RERANK_CANDIDATES = 24  # wide first-stage recall, before reranking
 TOP_K = 6               # final chunks passed to the generator
+
+# Diversity-aware final selection. When on (and a cross-encoder is available),
+# ALL candidates are scored once and select_diverse trades relevance against
+# within-document redundancy via greedy MMR, with a soft per-document cap. Off
+# falls back to the plain rerank ordering.
+SELECT_DIVERSE = True
+MMR_LAMBDA = 0.7   # relevance vs within-doc redundancy (1.0 = pure relevance)
+PER_DOC_CAP = 3    # soft max chunks per paper
 
 # Generation backend.
 GEN_PROVIDER = "ollama"  # "ollama" (local) | "anthropic" (Claude API) | "cborg" (LBNL gateway)
@@ -318,6 +329,36 @@ def _get_reranker():
     return model
 
 
+def _cross_encoder_scores(question: str, hits: list[dict]) -> list[float] | None:
+    """Score candidates with the active cross-encoder, or ``None`` if unavailable.
+
+    Shared by :func:`rerank` and :func:`select_diverse` so the (potentially slow)
+    cross-encoder runs once per retrieval. Honours ``USE_RERANKER`` and degrades
+    gracefully: returns ``None`` when reranking is disabled, there are no hits, or
+    the model fails to load or predict.
+
+    Args:
+        question: The query (already rewritten, in chat mode).
+        hits: Candidate chunk dicts from vector search.
+
+    Returns:
+        One relevance score per hit (same order), or ``None`` if the cross-encoder
+        is unavailable.
+    """
+    if not USE_RERANKER or not hits:
+        return None
+    try:
+        model = _get_reranker()
+        scores = model.predict([(question, h["text"]) for h in hits])
+    except Exception as exc:
+        print(
+            f"WARNING: cross-encoder unavailable ({exc!r}); falling back to vector order.",
+            file=sys.stderr,
+        )
+        return None
+    return [float(s) for s in scores]
+
+
 def rerank(question: str, hits: list[dict], top_k: int) -> list[dict]:
     """Re-order candidates by cross-encoder relevance, with graceful fallback.
 
@@ -330,15 +371,81 @@ def rerank(question: str, hits: list[dict], top_k: int) -> list[dict]:
         The ``top_k`` most relevant chunks. Falls back to vector order if the
         reranker is disabled or fails to load.
     """
-    if not USE_RERANKER or not hits:
+    scores = _cross_encoder_scores(question, hits)
+    if scores is None:
         return hits[:top_k]
-    try:
-        model = _get_reranker()
-    except Exception:
-        return hits[:top_k]
-    scores = model.predict([(question, h["text"]) for h in hits])
-    ranked = sorted(zip(hits, scores), key=lambda pair: float(pair[1]), reverse=True)
+    ranked = sorted(zip(hits, scores), key=lambda pair: pair[1], reverse=True)
     return [hit for hit, _ in ranked[:top_k]]
+
+
+def select_diverse(
+    candidates: list[dict],
+    scores: list[float],
+    top_k: int,
+    lambda_: float = MMR_LAMBDA,
+    per_doc_cap: int = PER_DOC_CAP,
+) -> list[dict]:
+    """Select ``top_k`` chunks balancing relevance against within-doc redundancy.
+
+    Greedy Maximal Marginal Relevance (MMR): at each step pick the candidate that
+    maximises ``lambda_ * relevance - (1 - lambda_) * redundancy``, where
+    redundancy is the largest cosine similarity to an already-selected chunk FROM
+    THE SAME ``doc_id``. Cross-document similarity is deliberately NOT penalised,
+    so two papers stating the same fact can both survive (corroboration).
+
+    A soft per-document cap is applied in two passes: the first respects
+    ``per_doc_cap``; if that cannot fill ``top_k``, a second pass admits overflow
+    so ``min(top_k, len(candidates))`` chunks are always returned.
+
+    Args:
+        candidates: Candidate chunk dicts; each must carry an L2-normalised
+            ``vector`` (LanceDB returns it from ``.to_list()``) and a ``doc_id``.
+        scores: One relevance score per candidate (same order). Min-max
+            normalised to [0, 1] internally for scale-stable mixing.
+        top_k: Number of chunks to return.
+        lambda_: Relevance weight in [0, 1]; ``1.0`` is pure relevance.
+        per_doc_cap: Soft maximum chunks per ``doc_id`` in the first pass.
+
+    Returns:
+        Up to ``top_k`` selected chunk dicts, in selection order.
+    """
+    if not candidates:
+        return []
+    # Vectors are L2-normalised, so dot product == cosine similarity.
+    vectors = np.asarray([c["vector"] for c in candidates], dtype=np.float32)
+    raw = np.asarray(scores, dtype=np.float32)
+    span = float(raw.max() - raw.min())
+    rel = (raw - raw.min()) / span if span > 0 else np.zeros(len(raw), dtype=np.float32)
+
+    selected: list[int] = []
+    by_doc: dict[str, list[int]] = defaultdict(list)
+
+    def best_candidate(respect_cap: bool) -> int | None:
+        """Return the unselected index with the highest MMR score, or None."""
+        best_idx, best_mmr = None, float("-inf")
+        for i in range(len(candidates)):
+            if i in selected:
+                continue
+            doc = candidates[i]["doc_id"]
+            if respect_cap and len(by_doc[doc]) >= per_doc_cap:
+                continue
+            redundancy = max((float(vectors[i] @ vectors[j]) for j in by_doc[doc]), default=0.0)
+            mmr = lambda_ * float(rel[i]) - (1.0 - lambda_) * redundancy
+            if mmr > best_mmr:
+                best_idx, best_mmr = i, mmr
+        return best_idx
+
+    # First pass respects the per-doc cap; second admits overflow to fill top_k.
+    for respect_cap in (True, False):
+        while len(selected) < top_k:
+            idx = best_candidate(respect_cap)
+            if idx is None:
+                break
+            selected.append(idx)
+            by_doc[candidates[idx]["doc_id"]].append(idx)
+        if len(selected) >= top_k:
+            break
+    return [candidates[i] for i in selected]
 
 
 # === Zotero discovery =======================================================
@@ -480,6 +587,13 @@ def discover_documents(zotero_dir: Path) -> list[Document]:
 def extract_pages(pdf_path: Path):
     """Yield per-page content from a PDF.
 
+    Tables are detected once per page via ``find_tables()`` and the result drives
+    both outputs: each non-empty table is rendered to Markdown AND its bounding
+    box is excluded from the prose (via :func:`figure_filter.extract_page_text`),
+    so a table's cells are not also re-extracted as garbled prose. A table whose
+    Markdown is empty is left untouched (its region is NOT excluded) so no
+    content is dropped without a replacement.
+
     Args:
         pdf_path: Path to the PDF.
 
@@ -493,18 +607,20 @@ def extract_pages(pdf_path: Path):
         return
     try:
         for pno, page in enumerate(doc, start=1):  # type: ignore[arg-type]
-            try:
-                text = page.get_text("text")
-            except Exception:
-                text = ""  # skip this page's text on failure rather than abort
             tables: list[str] = []
+            table_rects: list[fitz.Rect] = []
             try:
                 for table in page.find_tables().tables:
                     markdown = table.to_markdown()
                     if markdown and markdown.strip():
                         tables.append(markdown.strip())
+                        table_rects.append(fitz.Rect(table.bbox))
             except Exception:
                 pass
+            try:
+                text = extract_page_text(page, extra_regions=table_rects)
+            except Exception:
+                text = ""  # skip this page's text on failure rather than abort
             if text.strip() or tables:
                 yield pno, text, tables
     finally:
@@ -583,6 +699,53 @@ def chunk_page(text: str) -> list[str]:
     return [c for c in chunks if len(c) >= MIN_CHUNK_CHARS]
 
 
+def chunk_document(pages: list[tuple[int, str]]) -> list[tuple[int, int, str]]:
+    """Chunk a whole document so one idea can straddle a page break.
+
+    Each page's text is split on blank lines into paragraphs, each tagged with
+    its source page, and the tagged paragraphs are concatenated into a single
+    document-order stream. Packing then runs over that stream, so a paragraph
+    continued across a page boundary lands in the same chunk as its
+    continuation instead of being cut at the page edge. Oversized paragraphs are
+    hard-split first via :func:`_hard_split`, exactly as in :func:`chunk_page`,
+    and packing uses the same budget/overlap rules (``CHUNK_CHARS``,
+    ``CHUNK_OVERLAP``, ``MIN_CHUNK_CHARS``).
+
+    Each chunk is tagged with the ``(min_page, max_page)`` of the paragraphs it
+    contains. The overlap tail carried into a new chunk is attributed to the new
+    paragraph's page; this minor mis-attribution of the carried tail is
+    acceptable.
+
+    Args:
+        pages: ``(page_number, page_text)`` pairs in document order.
+
+    Returns:
+        ``(start_page, end_page, text)`` chunks, each at least ``MIN_CHUNK_CHARS``
+        characters long.
+    """
+    # Document-order paragraph stream, each paragraph tagged with its page.
+    tagged: list[tuple[int, str]] = []
+    for page_no, text in pages:
+        for para in (p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()):
+            pieces = _hard_split(para, CHUNK_CHARS) if len(para) > CHUNK_CHARS else [para]
+            tagged.extend((page_no, piece) for piece in pieces)
+
+    chunks: list[tuple[int, int, str]] = []
+    buffer = ""
+    buffer_pages: set[int] = set()
+    for page_no, para in tagged:
+        if buffer and len(buffer) + len(para) + 1 > CHUNK_CHARS:
+            chunks.append((min(buffer_pages), max(buffer_pages), buffer.strip()))
+            buffer = buffer[-CHUNK_OVERLAP:] + " " + para
+            buffer_pages = {page_no}  # carried tail attributed to the new para's page
+        else:
+            buffer = f"{buffer} {para}".strip()
+            buffer_pages.add(page_no)
+    if buffer.strip():
+        chunks.append((min(buffer_pages), max(buffer_pages), buffer.strip()))
+    return [(s, e, c) for s, e, c in chunks if len(c) >= MIN_CHUNK_CHARS]
+
+
 def split_oversized_records(records: list[dict]) -> list[dict]:
     """Hard-split any record whose text exceeds ``MAX_EMBED_CHARS``.
 
@@ -631,8 +794,13 @@ def render_page_png(pdf_path: str, page: int, dpi: int = IMAGE_DPI) -> bytes:
 def collect_page_images(hits: list[dict], max_images: int = MAX_IMAGES) -> list[bytes]:
     """Render the unique pages of the top hits to PNG bytes, capped.
 
+    A hit may span a page range ``[page, page_end]`` (cross-page chunks), so every
+    page in the range is rendered, in order, de-duplicated across hits and capped
+    at ``max_images``.
+
     Args:
-        hits: Retrieved chunk dicts (each has ``pdf_path`` and ``page``).
+        hits: Retrieved chunk dicts (each has ``pdf_path``, ``page`` and
+            ``page_end``).
         max_images: Maximum number of page images.
 
     Returns:
@@ -640,11 +808,11 @@ def collect_page_images(hits: list[dict], max_images: int = MAX_IMAGES) -> list[
     """
     seen: list[tuple[str, int]] = []
     for hit in hits:
-        key = (hit["pdf_path"], int(hit["page"]))
-        if key not in seen:
-            seen.append(key)
-        if len(seen) >= max_images:
-            break
+        for page in range(int(hit["page"]), int(hit["page_end"]) + 1):
+            key = (hit["pdf_path"], page)
+            if key not in seen:
+                seen.append(key)
+    seen = seen[:max_images]
     images: list[bytes] = []
     for pdf_path, page in seen:
         try:
@@ -652,6 +820,19 @@ def collect_page_images(hits: list[dict], max_images: int = MAX_IMAGES) -> list[
         except Exception:
             continue
     return images
+
+
+def _format_pages(page: int, page_end: int) -> str:
+    """Format a page citation: ``p.N`` for one page, ``pp.N-M`` for a range.
+
+    Args:
+        page: First page of the chunk.
+        page_end: Last page of the chunk (equals ``page`` for single-page chunks).
+
+    Returns:
+        A ``p.N`` or ``pp.N-M`` citation fragment.
+    """
+    return f"p.{page}" if page == page_end else f"pp.{page}-{page_end}"
 
 
 # === Dynamic LanceDB schema =================================================
@@ -676,6 +857,7 @@ def make_chunk_model(dim: int):
         title: str
         year: str
         page: int
+        page_end: int
         pdf_path: str
         text: str
         vector: Vector(dim)  # type: ignore[valid-type]
@@ -953,17 +1135,26 @@ class RAGPipeline:
         try:
             for i, doc in enumerate(tqdm(todo, desc="Ingesting", unit="doc"), start=1):
                 try:
-                    records = []
+                    # Prose is chunked across page breaks (chunk_document); tables
+                    # are collected per page and NEVER routed through it, since
+                    # cross-page packing would scramble a table's Markdown.
+                    pages: list[tuple[int, str]] = []
+                    table_records: list[dict] = []
                     for page_no, page_text, tables in extract_pages(doc.pdf_path):
-                        for idx, chunk_text in enumerate(chunk_page(page_text)):
-                            records.append(self._record(doc, page_no, f"{page_no}:{idx}", chunk_text))
+                        pages.append((page_no, page_text))
                         for tidx, table_md in enumerate(tables):
                             for sidx, piece in enumerate(_hard_split(table_md, CHUNK_CHARS)):
-                                records.append(
-                                    self._record(
-                                        doc, page_no, f"{page_no}:t{tidx}:{sidx}", f"Table:\n{piece}"
+                                table_records.append(
+                                    self._record_range(
+                                        doc, page_no, page_no,
+                                        f"{page_no}:t{tidx}:{sidx}", f"Table:\n{piece}",
                                     )
                                 )
+                    records = [
+                        self._record_range(doc, p_start, p_end, f"c{cidx}", chunk_text)
+                        for cidx, (p_start, p_end, chunk_text) in enumerate(chunk_document(pages))
+                    ]
+                    records.extend(table_records)
                     records = split_oversized_records(records)  # final size guard
                     if records:
                         vectors = embed_documents([r["text"] for r in records])
@@ -995,12 +1186,16 @@ class RAGPipeline:
         self._enforce_cap()
 
     @staticmethod
-    def _record(doc: Document, page_no: int, suffix: str, text: str) -> dict:
+    def _record_range(
+        doc: Document, page_start: int, page_end: int, suffix: str, text: str
+    ) -> dict:
         """Build a chunk record dict (without its vector).
 
         Args:
             doc: Source document.
-            page_no: 1-based page number.
+            page_start: 1-based first page contributing to the chunk.
+            page_end: 1-based last page contributing to the chunk; equals
+                ``page_start`` for single-page chunks (e.g. tables).
             suffix: Id suffix making the chunk unique within the document.
             text: Chunk text.
 
@@ -1012,7 +1207,8 @@ class RAGPipeline:
             "doc_id": doc.doc_id,
             "title": doc.title,
             "year": doc.year,
-            "page": page_no,
+            "page": page_start,
+            "page_end": page_end,
             "pdf_path": str(doc.pdf_path),
             "text": text,
         }
@@ -1020,18 +1216,28 @@ class RAGPipeline:
     # --- retrieval / generation --------------------------------------------
 
     def retrieve(self, question: str, top_k: int = TOP_K) -> list[dict]:
-        """Retrieve and rerank the most relevant chunks for a question.
+        """Retrieve and select the most relevant chunks for a question.
+
+        With ``SELECT_DIVERSE`` and a working cross-encoder, candidates are scored
+        once and passed to :func:`select_diverse` (MMR + soft per-doc cap);
+        otherwise the plain :func:`rerank` ordering is used. Either way, a disabled
+        or failing cross-encoder falls back to vector-search order.
 
         Args:
             question: Search query (already rewritten, in chat mode).
-            top_k: Number of chunks to return after reranking.
+            top_k: Number of chunks to return after selection.
 
         Returns:
-            The reranked top chunks.
+            The selected top chunks.
         """
         table = self._prepare()
         query_vector = embed_query(question)
         candidates = table.search(query_vector).limit(RERANK_CANDIDATES).to_list()
+        if SELECT_DIVERSE:
+            scores = _cross_encoder_scores(question, candidates)
+            if scores is not None:
+                return select_diverse(candidates, scores, top_k)
+            return candidates[:top_k]  # reranker unavailable -> vector order
         return rerank(question, candidates, top_k)
 
     def _build_context(self, hits: list[dict]) -> tuple[str, str]:
@@ -1045,12 +1251,13 @@ class RAGPipeline:
         """
         blocks, sources = [], []
         for n, hit in enumerate(hits, start=1):
+            pages = _format_pages(hit["page"], hit["page_end"])
             cite = hit["title"] + (f", {hit['year']}" if hit["year"] else "")
-            blocks.append(f"[{n}] ({cite}, p.{hit['page']})\n{hit['text']}")
+            blocks.append(f"[{n}] ({cite}, {pages})\n{hit['text']}")
             sources.append(
                 f"[{n}] {hit['title']}"
                 + (f" ({hit['year']})" if hit["year"] else "")
-                + f", p.{hit['page']}"
+                + f", {pages}"
             )
         return "\n\n".join(blocks), "\n".join(sources)
 
