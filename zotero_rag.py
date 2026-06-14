@@ -59,10 +59,12 @@ import re
 import sqlite3
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import fitz  # PyMuPDF
 import lancedb
@@ -237,7 +239,8 @@ def _embed_raw(texts: list[str]) -> list[list[float]]:
     for start in range(0, len(texts), EMBED_BATCH):
         batch = texts[start : start + EMBED_BATCH]
         resp = ollama.embed(model=model, input=batch, options={"num_ctx": EMBED_NUM_CTX})
-        vectors.extend(resp["embeddings"] if isinstance(resp, dict) else resp.embeddings)
+        embs = resp["embeddings"] if isinstance(resp, dict) else resp.embeddings
+        vectors.extend([list(e) for e in embs])
     return vectors
 
 
@@ -400,6 +403,9 @@ def load_zotero_metadata(zotero_dir: Path) -> dict[str, tuple[str, str]]:
     out: dict[str, tuple[str, str]] = {}
     try:
         con = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return {}
+    try:
         cur = con.cursor()
         titles = _field_values(cur, "title")
         dates = _field_values(cur, "date")
@@ -417,20 +423,29 @@ def load_zotero_metadata(zotero_dir: Path) -> dict[str, tuple[str, str]]:
             year_match = re.search(r"\b(\d{4})\b", raw_date or "")
             if title:
                 out[key] = (title, year_match.group(1) if year_match else "")
-        con.close()
     except sqlite3.Error:
         return {}
+    finally:
+        con.close()  # always release the handle, even on KeyboardInterrupt
     return out
 
 
 def discover_documents(zotero_dir: Path) -> list[Document]:
     """Find every stored PDF in the Zotero library with best-effort metadata.
 
+    A Zotero storage folder is keyed by an attachment key and normally holds a
+    single PDF, but can occasionally hold several (e.g. supplementary files). All
+    PDFs are indexed; to keep ``doc_id`` (and thus the chunk ids) unique without
+    re-ingesting the single-PDF common case, the first PDF in a multi-PDF folder
+    keeps the bare key as its ``doc_id`` and the rest get a ``<key>__<stem>``
+    suffix.
+
     Args:
         zotero_dir: Path to the Zotero data directory.
 
     Returns:
-        One :class:`Document` per PDF under ``storage/``.
+        One :class:`Document` per PDF under ``storage/``, each with a unique
+        ``doc_id``.
     """
     storage = zotero_dir / "storage"
     if not storage.is_dir():
@@ -439,11 +454,23 @@ def discover_documents(zotero_dir: Path) -> list[Document]:
             "Check ZOTERO_DIR, and ensure attachments are stored locally."
         )
     metadata = load_zotero_metadata(zotero_dir)
-    docs: list[Document] = []
+    by_key: dict[str, list[Path]] = defaultdict(list)
     for pdf_path in storage.glob("*/*.pdf"):
-        key = pdf_path.parent.name
-        title, year = metadata.get(key, (pdf_path.stem, ""))
-        docs.append(Document(doc_id=key, title=title, year=year, pdf_path=pdf_path))
+        by_key[pdf_path.parent.name].append(pdf_path)
+
+    docs: list[Document] = []
+    for key, paths in by_key.items():
+        title, year = metadata.get(key, ("", ""))
+        for i, pdf_path in enumerate(sorted(paths)):  # sorted -> deterministic ids
+            doc_id = key if i == 0 else f"{key}__{pdf_path.stem}"
+            docs.append(
+                Document(
+                    doc_id=doc_id,
+                    title=title or pdf_path.stem,
+                    year=year,
+                    pdf_path=pdf_path,
+                )
+            )
     return docs
 
 
@@ -465,7 +492,7 @@ def extract_pages(pdf_path: Path):
     except Exception:
         return
     try:
-        for pno, page in enumerate(doc, start=1):
+        for pno, page in enumerate(doc, start=1):  # type: ignore[arg-type]
             try:
                 text = page.get_text("text")
             except Exception:
@@ -651,7 +678,7 @@ def make_chunk_model(dim: int):
         page: int
         pdf_path: str
         text: str
-        vector: Vector(dim)
+        vector: Vector(dim)  # type: ignore[valid-type]
 
     return Chunk
 
@@ -701,7 +728,14 @@ class RAGPipeline:
         Returns:
             Table name strings.
         """
-        return list(self.db.list_tables().tables)
+        result = self.db.list_tables()
+        # lancedb >= 0.6 returns a paged object with a `.tables` attribute; older
+        # versions (and possible future API churn) return a plain iterable. Fall
+        # back to iterating directly so a shape change can't silently yield [],
+        # which would make every lookup miss and trigger spurious re-ingests.
+        if hasattr(result, "tables"):
+            return list(result.tables)
+        return [str(name) for name in result]  # type: ignore[union-attr]
 
     def _embedder_ids(self) -> set[str]:
         """Return the ids of all embedder tables currently on disk."""
@@ -780,7 +814,7 @@ class RAGPipeline:
             candidates = {t: registry.get(t, 0.0) for t in tables if t != active}
             if not candidates:
                 break
-            victim = min(candidates, key=candidates.get)
+            victim = min(candidates, key=lambda t: candidates[t])
             self._drop_embedder(victim)
             tables.discard(victim)
             registry.pop(victim, None)
@@ -1047,7 +1081,21 @@ class RAGPipeline:
         return self._generate_ollama(system, prompt, images, history)
 
     def _generate_ollama(self, system: str, prompt: str, images: list[bytes], history) -> str:
-        """Generate with a local Ollama chat model (images as raw bytes)."""
+        """Generate with a local Ollama chat model.
+
+        Images are attached to the user message as raw PNG bytes (Ollama's native
+        multimodal format), with a note appended to the prompt so the model knows
+        to read them.
+
+        Args:
+            system: System prompt.
+            prompt: User prompt text (sources followed by the question).
+            images: Page images as raw PNG bytes, or empty for text-only.
+            history: Prior chat messages (role/content dicts), or None.
+
+        Returns:
+            The model's reply text, stripped.
+        """
         user_message: dict = {"role": "user", "content": prompt}
         if images:
             user_message["images"] = images
@@ -1055,7 +1103,7 @@ class RAGPipeline:
                 prompt + "\n\n(Page images of these sources are attached; use their "
                 "figures and tables as needed.)"
             )
-        messages = [{"role": "system", "content": system}]
+        messages: list[dict] = [{"role": "system", "content": system}]
         if history:
             messages.extend(history[-MAX_HISTORY_MESSAGES:])
         messages.append(user_message)
@@ -1066,16 +1114,54 @@ class RAGPipeline:
             options={"temperature": GEN_TEMPERATURE, "num_ctx": GEN_NUM_CTX},
         )
         content = resp.message.content if hasattr(resp, "message") else resp["message"]["content"]
-        return content.strip()
+        return (content or "").strip()
 
     def _generate_anthropic(self, system: str, prompt: str, images: list[bytes], history) -> str:
-        """Generate with the Claude API (images as base64 content blocks)."""
+        """Generate with the Claude API via the Anthropic Messages API.
+
+        Builds an ``anthropic.Anthropic`` client (which reads ``ANTHROPIC_API_KEY``
+        from the environment) and issues a single Messages call against
+        ``ANTHROPIC_MODEL``. Images are attached as base64 ``image`` content blocks
+        before the prompt text.
+
+        Args:
+            system: System prompt (passed as the top-level ``system`` parameter).
+            prompt: User prompt text, appended after any image blocks.
+            images: Page images as raw PNG bytes, or empty for text-only.
+            history: Prior chat messages (role/content dicts), or None.
+
+        Returns:
+            The concatenated text of the response's text blocks, stripped.
+        """
         import anthropic
 
         client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the env
-        return self._generate_messages_api(
-            client, ANTHROPIC_MODEL, ANTHROPIC_MAX_TOKENS, system, prompt, images, history
+        blocks: list[dict] = []
+        for img in images:
+            blocks.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": base64.standard_b64encode(img).decode("ascii"),
+                    },
+                }
+            )
+        blocks.append({"type": "text", "text": prompt})
+        user_message: dict = {"role": "user", "content": blocks}
+        messages: list[Any] = []
+        if history:
+            messages.extend(history[-MAX_HISTORY_MESSAGES:])
+        messages.append(user_message)
+        resp = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            temperature=GEN_TEMPERATURE,
+            system=system,
+            messages=messages,
         )
+        return "".join(b.text for b in resp.content if b.type == "text").strip()
 
     def _generate_cborg(self, system: str, prompt: str, images: list[bytes], history) -> str:
         """Generate via CBORG (LBNL), an OpenAI-compatible LiteLLM gateway.
@@ -1084,7 +1170,20 @@ class RAGPipeline:
         API), authenticated with a bearer token (``$CBORG_API_KEY``) against
         ``CBORG_BASE_URL``. The client is built with explicit ``api_key`` and
         ``base_url`` so it does not depend on whatever ``OPENAI_*`` variables
-        happen to be exported in the shell.
+        happen to be exported in the shell, then delegated to
+        :meth:`_generate_openai`.
+
+        Args:
+            system: System prompt.
+            prompt: User prompt text (sources followed by the question).
+            images: Page images as raw PNG bytes, or empty for text-only.
+            history: Prior chat messages (role/content dicts), or None.
+
+        Returns:
+            The generated answer text, stripped.
+
+        Raises:
+            RuntimeError: If ``$CBORG_API_KEY`` is not set in the environment.
         """
         import openai
 
@@ -1103,11 +1202,11 @@ class RAGPipeline:
                 file=sys.stderr,
             )
         client = openai.OpenAI(api_key=token, base_url=CBORG_BASE_URL)
-        return self._generate_openai_compatible(
+        return self._generate_openai(
             client, CBORG_MODEL, CBORG_MAX_TOKENS, system, prompt, images, history
         )
 
-    def _generate_messages_api(
+    def _generate_openai(
         self,
         client,
         model: str,
@@ -1117,56 +1216,12 @@ class RAGPipeline:
         images: list[bytes],
         history,
     ) -> str:
-        """Run one Anthropic Messages API call (the ``anthropic`` provider path).
+        """Run one OpenAI chat-completions call (shared by OpenAI-compatible providers).
 
-        Args:
-            client: A configured ``anthropic.Anthropic`` client (auth and base
-                URL already set by the caller).
-            model: Model identifier or gateway alias to generate with.
-            max_tokens: Maximum number of tokens to generate.
-            system: System prompt.
-            prompt: User prompt text, appended after any image blocks.
-            images: Page images as raw PNG bytes, attached as base64 blocks.
-            history: Prior chat messages (role/content dicts), or None.
-
-        Returns:
-            The concatenated text of the response's text blocks, stripped.
-        """
-        blocks: list[dict] = []
-        for img in images:
-            blocks.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": base64.standard_b64encode(img).decode("ascii"),
-                    },
-                }
-            )
-        blocks.append({"type": "text", "text": prompt})
-        messages = list(history[-MAX_HISTORY_MESSAGES:]) if history else []
-        messages.append({"role": "user", "content": blocks})
-        resp = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=GEN_TEMPERATURE,
-            system=system,
-            messages=messages,
-        )
-        return "".join(b.text for b in resp.content if b.type == "text").strip()
-
-    def _generate_openai_compatible(
-        self,
-        client,
-        model: str,
-        max_tokens: int,
-        system: str,
-        prompt: str,
-        images: list[bytes],
-        history,
-    ) -> str:
-        """Run one OpenAI chat-completions call (the ``cborg`` provider path).
+        Generic worker for any OpenAI-compatible endpoint: the caller supplies a
+        configured client, model id, and token budget (e.g. :meth:`_generate_cborg`
+        points it at the CBORG gateway). Images are attached as base64 data-URI
+        ``image_url`` parts before the prompt text.
 
         Args:
             client: A configured ``openai.OpenAI`` client (api key and base URL
@@ -1175,30 +1230,32 @@ class RAGPipeline:
             max_tokens: Maximum number of tokens to generate.
             system: System prompt, sent as a leading ``system`` message.
             prompt: User prompt text, appended after any image parts.
-            images: Page images as raw PNG bytes, attached as base64 data-URI
-                ``image_url`` parts.
+            images: Page images as raw PNG bytes, or empty for text-only.
             history: Prior chat messages (role/content dicts), or None.
 
         Returns:
             The response message content, stripped.
         """
         if images:
-            parts: list[dict] = [{"type": "text", "text": prompt}]
+            # Images before the prompt text (matches _generate_anthropic and the
+            # convention that a vision model attends to images, then the question).
+            content: list[dict] = []
             for img in images:
                 data = base64.standard_b64encode(img).decode("ascii")
-                parts.append(
+                content.append(
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{data}"},
                     }
                 )
-            user_content: object = parts
+            content.append({"type": "text", "text": prompt})
+            user_message: dict = {"role": "user", "content": content}
         else:
-            user_content = prompt
+            user_message = {"role": "user", "content": prompt}
         messages: list[dict] = [{"role": "system", "content": system}]
         if history:
             messages.extend(history[-MAX_HISTORY_MESSAGES:])
-        messages.append({"role": "user", "content": user_content})
+        messages.append(user_message)
         resp = client.chat.completions.create(
             model=model,
             max_tokens=max_tokens,
@@ -1252,7 +1309,7 @@ class RAGPipeline:
                 options={"temperature": 0.0, "num_ctx": GEN_NUM_CTX},
             )
             text = resp.message.content if hasattr(resp, "message") else resp["message"]["content"]
-            return text.strip().strip('"') or question
+            return (text or "").strip().strip('"') or question
         except Exception:
             return question
 

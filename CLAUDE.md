@@ -79,8 +79,8 @@ corrupts the index or crashes the embedding runner.
   while Zotero is running. Metadata lookup is best-effort: any failure falls back to the PDF filename.
 
 - **Provider fan-out.** Three separate generation paths. `anthropic` uses the Anthropic SDK
-  (`_generate_messages_api`). `cborg` (LBNL gateway) is an **OpenAI-compatible LiteLLM proxy**, so it
-  uses the **OpenAI SDK** (`_generate_openai_compatible`, `chat.completions`) with a bearer token and
+  (`_generate_anthropic`, Messages API). `cborg` (LBNL gateway) is an **OpenAI-compatible LiteLLM
+  proxy**, so it uses the **OpenAI SDK** (`_generate_openai`, `chat.completions`) with a bearer token and
   custom `base_url`, and provider-prefixed model aliases (`anthropic/claude-sonnet`) — it is *not*
   Anthropic-API-compatible despite generating with Claude. Ollama has its own path. All three pass
   `GEN_TEMPERATURE`. Chat-mode query rewriting always runs locally via Ollama regardless of `GEN_PROVIDER`.
