@@ -151,7 +151,7 @@ TOP_K = 6               # final chunks passed to the generator
 
 # Generation backend.
 GEN_PROVIDER = "ollama"  # "ollama" (local) | "anthropic" (Claude API) | "cborg" (LBNL gateway)
-GEN_MODEL = "gemma4:26b"  # Ollama model. For MULTIMODAL must be vision + NON-MLX.
+GEN_MODEL = "qwen3.6:35b"  # Ollama model. For MULTIMODAL must be vision + NON-MLX.
 GEN_NUM_CTX = 8192
 GEN_TEMPERATURE = 0.2
 ANTHROPIC_MODEL = "claude-sonnet-4-6"  # used only when GEN_PROVIDER == "anthropic"
