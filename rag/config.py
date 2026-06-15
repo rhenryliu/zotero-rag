@@ -63,22 +63,52 @@ class RerankerSpec:
     Attributes:
         model: HuggingFace model id.
         trust_remote_code: Pass through to CrossEncoder (needed for gte).
-        sigmoid: Apply Sigmoid activation for 0-1 scores (Qwen3-Reranker).
+        sigmoid: Apply Sigmoid activation so scores fall in [0, 1]. Required for
+            the relevance thresholds below to be meaningful -- raw logits are
+            unbounded and model-specific, so ``min_score`` / ``soft_score`` are
+            only set for sigmoid rerankers (a non-sigmoid reranker leaves them
+            ``None`` -> no thresholding, current behavior preserved).
+        min_score: Hard per-chunk floor in [0, 1]. Chunks scoring below this are
+            dropped from the sources entirely; if NO chunk clears it the query is
+            answered as "nothing sufficiently relevant". ``None`` disables it.
+        soft_score: Marginal-vs-solid cut in [0, 1] (>= ``min_score``). Surviving
+            chunks below this are kept but flagged "marginal relevance" in the
+            citations and the model context; when EVERY survivor is marginal the
+            answer carries a low-confidence caveat. ``None`` disables the tier.
     """
 
     model: str
     trust_remote_code: bool
     sigmoid: bool
+    min_score: float | None = None
+    soft_score: float | None = None
 
 
 # Selectable rerankers. All three load through the same sentence-transformers
 # CrossEncoder interface (per-model flags below). Reranking runs on MPS, NOT
 # Ollama (which has no rerank endpoint). Switching needs no re-ingest.
 RERANKERS: dict[str, RerankerSpec] = {
-    "bge": RerankerSpec("BAAI/bge-reranker-v2-m3", trust_remote_code=False, sigmoid=False),
+    # min_score/soft_score are on the SIGMOID [0,1] scale, calibrated against this
+    # library's actual reranked nearest-neighbors (not contrived pairs, which look
+    # falsely bimodal): off-domain queries top out low (pure biology ~0.026,
+    # tangential semiconductor-vs-CMB-detector ~0.089) while a genuinely-soft ML
+    # query reaches ~0.61. So the floor sits at 0.075 -- above clearly-irrelevant
+    # queries (which then refuse locally with no generation call) but below loosely
+    # adjacent ones (kept as flagged-marginal) -- and the marginal cut is 0.5, which
+    # cleanly split the soft query (2 on-point chunks solid, the rest marginal).
+    # Retune against your own library.
+    "bge": RerankerSpec(
+        "BAAI/bge-reranker-v2-m3", trust_remote_code=False, sigmoid=True,
+        min_score=0.075, soft_score=0.50,
+    ),
+    # gte stays raw-logit (sigmoid=False) -> thresholds left None (unbounded scale).
     "gte": RerankerSpec("Alibaba-NLP/gte-reranker-modernbert-base", trust_remote_code=True, sigmoid=False),
     # Qwen3-Reranker is autoregressive -> higher per-pair latency than the BERT-based two.
-    "qwen3": RerankerSpec("Qwen/Qwen3-Reranker-0.6B", trust_remote_code=False, sigmoid=True),
+    # Thresholds mirror bge's [0,1] bands (not separately calibrated yet).
+    "qwen3": RerankerSpec(
+        "Qwen/Qwen3-Reranker-0.6B", trust_remote_code=False, sigmoid=True,
+        min_score=0.02, soft_score=0.50,
+    ),
 }
 RERANKER = "bge"  # <-- one-line A/B switch: "bge" | "gte" | "qwen3"
 

@@ -2,7 +2,7 @@
 
 Local retrieval-augmented generation over your Zotero PDF library. It indexes the PDFs in your Zotero storage, retrieves the most relevant passages for a question, reranks them with a cross-encoder, and generates a grounded answer with inline `[n]` citations back to the exact paper and page.
 
-Everything runs locally by default on [Ollama](https://ollama.com). Only the final generation step can optionally be routed to a remote model (Claude via the Anthropic API or the LBNL Cborg gateway) — embedding and reranking always run locally.
+Embedding, reranking, and query rewriting always run locally on [Ollama](https://ollama.com). Only the final generation step contacts a model that may be remote — and the shipped default routes it through the LBNL Cborg gateway with page images attached (`GEN_PROVIDER="cborg"`, `MULTIMODAL=True`). Set `GEN_PROVIDER="ollama"` for a fully-local, offline setup.
 
 ## Contents
 
@@ -28,8 +28,8 @@ The pipeline runs in seven stages:
 3. **Chunking** — overlapping, paragraph-aware chunks (~350 tokens) packed *across* page breaks, so an idea that straddles a page boundary stays in one chunk. Each chunk records its page span, so citations point at a single page (`p.N`) or a range (`pp.N-M`).
 4. **Embedding** — chunks become vectors via a selectable Ollama embedding model.
 5. **Storage** — LanceDB, with **one table per embedder** (vectors from different models aren't comparable), keyed by model + dimension.
-6. **Retrieval** — embed the query, pull the 24 nearest chunks, and score them all with a cross-encoder. Duplicate copies of the same work — same title under different DOIs, which Zotero often leaves unmerged — are then collapsed to a single source, so a paper indexed twice doesn't crowd out other papers (`TITLE_DEDUP`; audit them with `stats --duplicates`). Selection is **diversity-aware** by default (MMR): it trades relevance against redundancy *within the same paper* and applies a soft per-paper cap, so a single document can't dominate the context — while passages from *different* papers can still corroborate one another. Set `SELECT_DIVERSE=False` for plain top-k rerank ordering.
-7. **Generation** — a grounded answer with inline `[n]` citations, via Ollama or a remote provider. With `MULTIMODAL` enabled, the retrieved pages are rendered and attached so a vision model can read figures and tables directly.
+6. **Retrieval** — embed the query, pull the 32 nearest chunks, and score them all with a cross-encoder. Chunks scoring below a **relevance floor** are dropped — so a question your library can't support returns nothing (and the pipeline says so plainly, skipping generation entirely) rather than answering from irrelevant passages — while survivors that are only weakly matched are flagged *marginal* and carried through to the citations. Duplicate copies of the same work — same title under different DOIs, which Zotero often leaves unmerged — are then collapsed to a single source, so a paper indexed twice doesn't crowd out other papers (`TITLE_DEDUP`; audit them with `stats --duplicates`). Selection is **diversity-aware** by default (MMR): it trades relevance against redundancy *within the same paper* and applies a soft per-paper cap, so a single document can't dominate the context — while passages from *different* papers can still corroborate one another. Set `SELECT_DIVERSE=False` for plain top-k rerank ordering.
+7. **Generation** — a grounded answer with inline `[n]` citations, via Ollama or a remote provider. Sources flagged *marginal relevance* are marked in the citation list and the model is told to lean on the stronger sources; if **every** retrieved source is marginal, the answer is prefixed with a low-confidence caveat. With `MULTIMODAL` enabled, the retrieved pages are rendered and attached so a vision model can read figures and tables directly.
 
 Two query modes are available: a one-shot `query` with no memory, and a conversational `chat` with history-aware query rewriting.
 
@@ -79,8 +79,8 @@ Local models are served by Ollama and must be pulled once. The reranker is **not
 # Default embedder (verify the exact tag in your Ollama registry first)
 ollama pull qwen3-embedding:0.6b
 
-# Default local generation model
-ollama pull qwen3.6:35b
+# Default local generation model (used when GEN_PROVIDER="ollama")
+ollama pull qwen3.6:27b
 
 # Query-rewriting model used in chat mode
 ollama pull qwen3.5:9b
@@ -201,20 +201,20 @@ Most knobs live in `rag/config.py` (including the figure-detection tunables — 
 | `RERANKER` | `bge` | `bge` (`BAAI/bge-reranker-v2-m3`) \| `gte` (`Alibaba-NLP/gte-reranker-modernbert-base`) \| `qwen3` (`Qwen/Qwen3-Reranker-0.6B`, slower). One-line switch; no re-ingest needed. |
 | `USE_RERANKER` | `True` | Disable to use raw vector order. |
 | `RERANK_DEVICE` | `mps` | Auto-falls back to CPU on load/predict failure. |
-| `RERANK_CANDIDATES` | `24` | First-stage recall width before reranking. |
-| `TOP_K` | `6` | Chunks selected and passed to the generator. |
+| `RERANK_CANDIDATES` | `32` | First-stage recall width before reranking. |
+| `TOP_K` | `8` | Chunks selected and passed to the generator. |
 | `SELECT_DIVERSE` | `True` | Diversity-aware final selection (MMR) over the scored candidates. `False` = plain top-k rerank order. |
 | `MMR_LAMBDA` | `0.7` | Relevance vs within-paper redundancy trade-off (`1.0` = pure relevance). |
 | `PER_DOC_CAP` | `3` | Soft cap on chunks selected from any one paper. |
 | `TITLE_DEDUP` | `True` | Collapse duplicate copies of one work (same title, different DOI — which Zotero leaves unmerged) at query time, keeping the highest-scored copy. No re-ingest; audit with `stats --duplicates`. |
 | `TITLE_DEDUP_YEAR_WINDOW` | `1` | Max year gap for two same-title copies to count as one work; `None` matches on the normalized title alone. |
-| `GEN_PROVIDER` | `ollama` | `ollama` (local) \| `anthropic` (Claude API) \| `cborg` (LBNL gateway). |
-| `GEN_MODEL` | `qwen3.6:35b` | Ollama generation model. For `MULTIMODAL` it must be vision-capable and non-MLX (e.g. `gemma4:26b`). |
+| `GEN_PROVIDER` | `cborg` | `ollama` (local) \| `anthropic` (Claude API) \| `cborg` (LBNL gateway). |
+| `GEN_MODEL` | `qwen3.6:27b` | Ollama generation model (used when `GEN_PROVIDER="ollama"`). For `MULTIMODAL` it must be vision-capable and non-MLX (e.g. `gemma4:26b`). |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Used when `GEN_PROVIDER="anthropic"`. |
-| `CBORG_MODEL` | `claude-sonnet` | Cborg alias; used when `GEN_PROVIDER="cborg"`. See [Generation providers](#generation-providers). |
+| `CBORG_MODEL` | `anthropic/claude-sonnet` | Cborg alias; used when `GEN_PROVIDER="cborg"`. See [Generation providers](#generation-providers). |
 | `CBORG_BASE_URL` | `https://api.cborg.lbl.gov` | Cborg API endpoint. |
 | `REWRITE_MODEL` | `qwen3.5:9b` | Local Ollama model for chat query rewriting (always local, regardless of `GEN_PROVIDER`). |
-| `MULTIMODAL` | `False` | Render retrieved pages to images and attach them to a vision generation model. |
+| `MULTIMODAL` | `True` | Render retrieved pages to images and attach them to a vision generation model. |
 | `IMAGE_DPI` / `MAX_IMAGES` | `150` / `3` | Page-image render resolution and cap. |
 | `CHUNK_CHARS` | `1400` | Target chunk size; over-long paragraphs and tables are split below this. |
 | `CHUNK_OVERLAP` | `250` | Overlap between adjacent chunks. |
@@ -225,13 +225,15 @@ Most knobs live in `rag/config.py` (including the figure-detection tunables — 
 
 A few **figure-detection** tunables also live in `rag/config.py` (consumed by `rag/figure_filter.py`): `FIGURE_MIN_AREA_FRAC` (the area gate that separates figures from display equations), `FIGURE_PAD` (region inflation, in points), and `FIGURE_GRANULARITY` (`"line"` drops only in-figure lines, protecting captions that share a text block with plot annotations; `"block"` drops whole blocks).
 
+**Relevance thresholds (per reranker).** Each entry in the `RERANKERS` dict carries an optional `min_score` (hard floor) and `soft_score` (marginal cut), both on the cross-encoder's **sigmoid `[0, 1]` scale**. Chunks below `min_score` are dropped (a query with nothing above the floor returns no answer and skips generation); survivors below `soft_score` are kept but flagged *marginal relevance* in the citations and the model context, and an all-marginal result is captioned low-confidence. Raw cross-encoder logits are unbounded and model-specific, so these are only meaningful with `sigmoid=True` — the default `bge` (`min_score=0.075`, `soft_score=0.5`) and `qwen3` enable it, while `gte` leaves both unset (`None`), disabling gating and preserving plain ranking. The values are calibrated against a library's own score distribution; retune them with `tests/probe_reranker_sigmoid.py`.
+
 ## Generation providers
 
 Set `GEN_PROVIDER` to choose where answers are generated. Embedding and reranking are unaffected — they're always local.
 
-### `ollama` (default, fully local)
+### `ollama` (fully local)
 
-Uses `GEN_MODEL` (default `qwen3.6:35b`). No API key, no network. This is the only provider that works fully offline.
+Uses `GEN_MODEL` (default `qwen3.6:27b`). No API key, no network. This is the only provider that works fully offline.
 
 ### `anthropic` (Claude API)
 
@@ -241,7 +243,7 @@ Uses `ANTHROPIC_MODEL` via the official Anthropic API. Requires an API key in th
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-### `cborg` (LBNL gateway)
+### `cborg` (LBNL gateway, shipped default)
 
 Routes generation through Berkeley Lab's [Cborg](https://cborg.lbl.gov) gateway (free for `@lbl.gov`, `@es.net`, and `@nersc.gov` accounts). Requires a key in the environment:
 
@@ -292,6 +294,7 @@ Everything lives under `INDEX_DIR` (`~/.cache/zotero_rag`):
 ## Notes and limitations
 
 - **Local-first.** Embedding, reranking, and query rewriting always run locally on Ollama/MPS. Only final generation can be remote.
+- **Out-of-domain queries are gated.** Retrieval applies a per-reranker relevance floor on the cross-encoder's sigmoid score, so a question your library can't support returns "no sufficiently relevant content" (and skips the generation call) instead of answering from unrelated passages; weakly-matched sources are flagged *marginal* and an all-marginal answer is captioned low-confidence. The floor is only active for `sigmoid=True` rerankers and is calibrated per library (see [Configuration](#configuration)).
 - **No OCR.** Scanned/image-only PDFs without a text layer are skipped.
 - **Apple Silicon assumed for the reranker.** It runs on MPS with a CPU fallback; other accelerators aren't specially handled.
 - **Ingest is incremental and resumable.** Re-running `ingest` only processes new or previously-failed papers; it won't duplicate existing chunks.

@@ -102,6 +102,21 @@ corrupts the index or crashes the embedding runner.
   `PER_DOC_CAP` two-pass fill; otherwise the survivors are ranked by score and sliced. A disabled or
   failed reranker falls back to vector-search order (no dedup) in every path.
 
+- **Relevance gating (two-tier, sigmoid-only).** After scoring (and `_canonicalize_by_title`),
+  `retrieve` applies a per-reranker hard floor `RERANKERS[RERANKER].min_score` to the ABSOLUTE
+  scores. **This MUST run before `select_diverse`**, which min-max normalises the scores and would
+  otherwise erase the absolute scale (the best of a bad lot becomes 1.0). Chunks below the floor are
+  dropped (so retrieval is variable-k, not always `TOP_K`); if NONE survive, `retrieve` returns `[]`
+  and `query`/`chat` answer with `_NO_RELEVANT_MSG` — no generation call. Each survivor's absolute
+  score is then stashed on its hit dict so `_build_context` can tag sub-`soft_score` chunks
+  `-- marginal relevance` in BOTH the model context and the user source list; when EVERY survivor is
+  marginal, `query`/`chat` prepend `_LOW_CONFIDENCE_CAVEAT` (display-only in chat — the stored
+  history keeps the clean answer, so the caveat never leaks into later rewrite/generation). Both
+  thresholds live on `RerankerSpec` and are only meaningful on the bounded sigmoid `[0,1]` scale, so
+  they are set ONLY for `sigmoid=True` rerankers (`bge`, `qwen3`); a `None` threshold disables that
+  tier, and the reranker-off path (scores `None`) returns before gating, preserving vector-order
+  behavior. Thresholds are library-calibrated — recalibrate via `tests/probe_reranker_sigmoid.py`.
+
 - **Idempotent, crash-safe ingest.** Records use deterministic ids (prose `<doc_id>:c<n>`, tables
   `<doc_id>:<page>:t<tidx>:<sidx>`) and are
   written with `merge_insert("id")` (upsert), **never** `table.add` (which double-counts on retry).

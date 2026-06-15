@@ -65,6 +65,20 @@ def _format_pages(page: int, page_end: int) -> str:
     return f"p.{page}" if page == page_end else f"pp.{page}-{page_end}"
 
 
+# Shown when retrieval returns nothing -- either the library is unindexed or every
+# candidate fell below the reranker's hard floor (see RAGPipeline.retrieve).
+_NO_RELEVANT_MSG = (
+    "No sufficiently relevant content found for this query. "
+    "(If you haven't indexed your library yet, run `ingest`.)"
+)
+# Prepended to an answer when EVERY retrieved source is marginal (all below the
+# reranker's soft_score), so the whole-answer caveat falls out of the per-chunk band.
+_LOW_CONFIDENCE_CAVEAT = (
+    "_Low confidence: no strongly-matching sources were found; the answer below "
+    "rests only on marginally relevant material and may be unreliable._\n\n"
+)
+
+
 class RAGPipeline:
     """End-to-end local RAG over a Zotero library.
 
@@ -445,13 +459,54 @@ class RAGPipeline:
             candidates, scores = _canonicalize_by_title(
                 candidates, scores, TITLE_DEDUP_YEAR_WINDOW
             )
+        # Per-chunk hard floor on ABSOLUTE cross-encoder scores -- it MUST run here,
+        # before select_diverse min-max normalizes the scores away (the best of a
+        # bad lot would otherwise look perfect). Drop clearly-irrelevant chunks; if
+        # NOTHING clears the floor, return [] so the caller answers "nothing
+        # relevant" rather than padding the context with junk. Only meaningful on
+        # the bounded sigmoid scale, so it is skipped when min_score is None.
+        spec = RERANKERS[RERANKER]
+        if spec.min_score is not None:
+            kept = [(c, s) for c, s in zip(candidates, scores) if s >= spec.min_score]
+            if not kept:
+                return []
+            candidates, scores = [c for c, _ in kept], [s for _, s in kept]
+        # Stash the absolute score on each hit so _build_context can band it
+        # (solid vs marginal) regardless of the selection order below.
+        for cand, score in zip(candidates, scores):
+            cand["score"] = score
         if SELECT_DIVERSE:
             return select_diverse(candidates, scores, top_k)
         ranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
         return [hit for hit, _ in ranked[:top_k]]
 
+    @staticmethod
+    def _is_marginal(hit: dict) -> bool:
+        """Return whether a hit is only marginally relevant.
+
+        True when the active reranker defines a ``soft_score`` and the hit's stashed
+        absolute score is below it. Hits without a score (the reranker-off path,
+        which never thresholds) or rerankers without a ``soft_score`` (raw-logit,
+        unbounded scale) are never marginal.
+
+        Args:
+            hit: A retrieved chunk dict, optionally carrying a ``score``.
+
+        Returns:
+            Whether to flag the hit as marginal in citations and context.
+        """
+        soft = RERANKERS[RERANKER].soft_score
+        score = hit.get("score")
+        return soft is not None and score is not None and score < soft
+
     def _build_context(self, hits: list[dict]) -> tuple[str, str]:
         """Format retrieved chunks into a context block and a source list.
+
+        Chunks scoring below the active reranker's ``soft_score`` are tagged
+        ``-- marginal relevance`` in BOTH the model-facing context (so the model
+        can weight them down per the system prompt) and the user-facing source
+        list. Tags are inline rather than reordered, so the ``[n]`` numbering stays
+        aligned with selection order.
 
         Args:
             hits: Retrieved chunk dicts.
@@ -463,11 +518,12 @@ class RAGPipeline:
         for n, hit in enumerate(hits, start=1):
             pages = _format_pages(hit["page"], hit["page_end"])
             cite = hit["title"] + (f", {hit['year']}" if hit["year"] else "")
-            blocks.append(f"[{n}] ({cite}, {pages})\n{hit['text']}")
+            tag = " -- marginal relevance" if self._is_marginal(hit) else ""
+            blocks.append(f"[{n}] ({cite}, {pages}){tag}\n{hit['text']}")
             sources.append(
                 f"[{n}] {hit['title']}"
                 + (f" ({hit['year']})" if hit["year"] else "")
-                + f", {pages}"
+                + f", {pages}{tag}"
             )
         return "\n\n".join(blocks), "\n".join(sources)
 
@@ -491,7 +547,10 @@ class RAGPipeline:
             "You are a precise research assistant. Answer ONLY using the provided "
             "sources. Cite every claim inline with [n] referring to the source "
             "numbers. If the sources do not contain the answer, say so plainly "
-            "rather than guessing."
+            "rather than guessing. Sources tagged 'marginal relevance' were only "
+            "weakly matched to the question -- rely on them with caution, prefer "
+            "the untagged sources, and flag any claim that rests only on a marginal "
+            "source."
         )
         prompt = f"Sources:\n\n{context}\n\nQuestion: {question}"
         images = collect_page_images(hits) if MULTIMODAL else []
@@ -509,9 +568,11 @@ class RAGPipeline:
         """
         hits = self.retrieve(question, top_k)
         if not hits:
-            return "No indexed content found. Run `ingest` first."
+            return _NO_RELEVANT_MSG
         answer = self._generate(question, hits)
         _, sources = self._build_context(hits)
+        if all(self._is_marginal(h) for h in hits):
+            answer = _LOW_CONFIDENCE_CAVEAT + answer
         return f"{answer}\n\nSources:\n{sources}"
 
     def rewrite_query(self, history: list[dict], question: str) -> str:
@@ -564,11 +625,16 @@ class RAGPipeline:
             search_query = self.rewrite_query(history, user)
             hits = self.retrieve(search_query)
             if not hits:
-                print("\nrag> No indexed content found. Run `ingest` first.\n")
+                print(f"\nrag> {_NO_RELEVANT_MSG}\n")
                 continue
             answer = self._generate(user, hits, history)
             _, sources = self._build_context(hits)
-            print(f"\nrag> {answer}\n\n{sources}\n")
+            # The caveat is a display concern; keep the stored answer clean so it
+            # doesn't leak into later rewrite/generation context.
+            display = _LOW_CONFIDENCE_CAVEAT + answer if all(
+                self._is_marginal(h) for h in hits
+            ) else answer
+            print(f"\nrag> {display}\n\n{sources}\n")
             history.append({"role": "user", "content": user})
             history.append({"role": "assistant", "content": answer})
 
