@@ -60,6 +60,7 @@ import re
 import sqlite3
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -159,6 +160,20 @@ TOP_K = 6               # final chunks passed to the generator
 SELECT_DIVERSE = True
 MMR_LAMBDA = 0.7   # relevance vs within-doc redundancy (1.0 = pure relevance)
 PER_DOC_CAP = 3    # soft max chunks per paper
+
+# Query-time canonicalization of duplicate copies of the same work. Zotero does
+# NOT flag same-title items with different DOIs as duplicates (the DOI mismatch
+# vetoes the match), so preprint/published pairs and arXiv-vs-journal copies
+# coexist as distinct doc_ids with near-identical content. select_diverse never
+# penalizes cross-doc similarity (by design, to keep corroboration), so those
+# copies surface as repeated sources. Keying on the title -- the field that
+# survives versioning -- keeps one copy per work. Honest limits: a generic title
+# shared by genuinely different works WILL merge if their years fall within the
+# window (rare; the window bounds it), and a version whose title was edited beyond
+# normalization will NOT merge (rare; titles are the stable field across versions).
+# Switching needs NO re-ingest (operates on candidates already in the index).
+TITLE_DEDUP = True
+TITLE_DEDUP_YEAR_WINDOW = 1  # None = match on normalized title alone
 
 # Generation backend.
 GEN_PROVIDER = "ollama"  # "ollama" (local) | "anthropic" (Claude API) | "cborg" (LBNL gateway)
@@ -362,6 +377,12 @@ def _cross_encoder_scores(question: str, hits: list[dict]) -> list[float] | None
 def rerank(question: str, hits: list[dict], top_k: int) -> list[dict]:
     """Re-order candidates by cross-encoder relevance, with graceful fallback.
 
+    NOT on the hot path: :meth:`RAGPipeline.retrieve` scores via
+    :func:`_cross_encoder_scores` (the shared primitive) and inlines its own
+    score/dedup/select sequence, so it does not call this. Retained as a
+    standalone convenience for one-off scripting; note that calling it runs a
+    fresh cross-encoder pass (it re-scores ``hits`` internally).
+
     Args:
         question: The query (already rewritten, in chat mode).
         hits: Candidate chunk dicts from vector search.
@@ -446,6 +467,133 @@ def select_diverse(
         if len(selected) >= top_k:
             break
     return [candidates[i] for i in selected]
+
+
+# === Title canonicalization (query-time duplicate-copy removal) ==============
+
+
+def _normalize_title(title: str) -> str:
+    """Normalize a title into a key for matching duplicate copies of a work.
+
+    NFKD-normalizes, strips combining marks, casefolds, replaces every
+    non-alphanumeric character with a space, then collapses whitespace and strips.
+    Pure and deterministic; adds no new dependency (``unicodedata`` is stdlib).
+
+    Args:
+        title: Raw title (may be empty).
+
+    Returns:
+        The normalized matching key (possibly empty for a title with no
+        alphanumerics).
+    """
+    decomposed = unicodedata.normalize("NFKD", title or "")
+    without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    folded = without_marks.casefold()
+    spaced = "".join(ch if ch.isalnum() else " " for ch in folded)
+    return " ".join(spaced.split())
+
+
+def _title_year(year: str | None) -> int | None:
+    """Parse a 4-digit year from a record's ``year`` field, or ``None`` if absent."""
+    match = re.search(r"\d{4}", year or "")
+    return int(match.group()) if match else None
+
+
+def _years_compatible(
+    year: int | None, anchor_year: int | None, year_window: int | None
+) -> bool:
+    """Return whether two years are close enough to be the same work.
+
+    True when matching on title alone (``year_window`` is None) or when either year
+    is missing; otherwise the years must differ by at most ``year_window``. A
+    missing year therefore falls back to title-only matching for that candidate.
+
+    Args:
+        year: Candidate year, or None.
+        anchor_year: Anchor year, or None.
+        year_window: Max allowed absolute year difference, or None.
+
+    Returns:
+        Whether the candidate may join the anchor on the year test.
+    """
+    if year_window is None or year is None or anchor_year is None:
+        return True
+    return abs(year - anchor_year) <= year_window
+
+
+def _canonicalize_by_title(
+    candidates: list[dict],
+    scores: list[float],
+    year_window: int | None,
+) -> tuple[list[dict], list[float]]:
+    """Drop duplicate copies of the same work, keeping the highest-scored copy.
+
+    Zotero leaves same-title items with different DOIs unmerged, so one work can
+    appear under several ``doc_id``s (preprint vs published, arXiv vs journal) with
+    near-identical content that :func:`select_diverse` deliberately does not
+    penalize (cross-doc similarity is kept for corroboration). This collapses those
+    at query time, keyed on the normalized title -- the field stable across
+    versions.
+
+    Candidates are processed in DESCENDING score order, so the first copy of a work
+    seen (its highest-scored chunk) becomes that work's anchor and any lower-scored
+    copy is the one dropped; processing in any other order could keep the worse
+    copy. Each anchor records its kept ``doc_id`` and year. A candidate joins an
+    existing anchor when their normalized titles are equal AND their years are
+    compatible (see :func:`_years_compatible`); it is then KEPT only if it is the
+    anchor's own ``doc_id`` (another chunk of the already-kept copy) and DROPPED
+    otherwise (a different copy of the same work). A candidate matching no anchor
+    establishes a new one and is kept -- so a generic title whose years fall outside
+    the window yields two anchors = two distinct works, both kept. Different
+    normalized titles are NEVER merged, so cross-paper corroboration is preserved.
+
+    Honesty: a generic title shared by genuinely different works WILL merge if their
+    years fall within ``year_window`` (rare; the window bounds it); a version whose
+    title was edited beyond normalization will NOT merge (rare; titles are the
+    stable field across versions); a missing year falls back to title-only matching
+    for that candidate; and a title that normalizes to an empty key (no
+    alphanumerics) is never anchored, so such candidates are always kept (no
+    untitled-vs-untitled collapse).
+
+    Args:
+        candidates: Candidate chunk dicts (each with ``doc_id``, ``title``,
+            ``year``).
+        scores: One relevance score per candidate, aligned with ``candidates``.
+        year_window: Max year difference for two same-title copies to count as one
+            work; ``None`` matches on the normalized title alone.
+
+    Returns:
+        ``(kept_candidates, kept_scores)``, aligned and still in descending-score
+        order.
+    """
+    # Per normalized title, a list of (kept doc_id, year) anchors -- more than one
+    # only when years are incompatible (so a shared generic title can split into
+    # distinct works).
+    anchors: dict[str, list[tuple[str, int | None]]] = defaultdict(list)
+    kept_candidates: list[dict] = []
+    kept_scores: list[float] = []
+    # Descending score so the higher-scored copy of a work anchors it and the
+    # lower-scored copies are the ones dropped.
+    for i in sorted(range(len(candidates)), key=lambda j: scores[j], reverse=True):
+        cand = candidates[i]
+        key = _normalize_title(cand["title"])
+        if not key:  # no title key to anchor on -> never merge, always keep
+            kept_candidates.append(cand)
+            kept_scores.append(scores[i])
+            continue
+        year = _title_year(cand.get("year", ""))
+        anchor = next(
+            (a for a in anchors[key] if _years_compatible(year, a[1], year_window)),
+            None,
+        )
+        if anchor is not None:
+            if cand["doc_id"] != anchor[0]:
+                continue  # a different copy of the same work -> drop
+        else:
+            anchors[key].append((cand["doc_id"], year))  # new work -> new anchor
+        kept_candidates.append(cand)
+        kept_scores.append(scores[i])
+    return kept_candidates, kept_scores
 
 
 # === Zotero discovery =======================================================
@@ -1218,10 +1366,13 @@ class RAGPipeline:
     def retrieve(self, question: str, top_k: int = TOP_K) -> list[dict]:
         """Retrieve and select the most relevant chunks for a question.
 
-        With ``SELECT_DIVERSE`` and a working cross-encoder, candidates are scored
-        once and passed to :func:`select_diverse` (MMR + soft per-doc cap);
-        otherwise the plain :func:`rerank` ordering is used. Either way, a disabled
-        or failing cross-encoder falls back to vector-search order.
+        Candidates are cross-encoder scored ONCE. With ``TITLE_DEDUP``,
+        :func:`_canonicalize_by_title` then collapses duplicate copies of the same
+        work (same title, different DOI -- the duplicates Zotero misses) before
+        selection, on every path. Finally, with ``SELECT_DIVERSE`` and a working
+        cross-encoder, the survivors are passed to :func:`select_diverse` (MMR +
+        soft per-doc cap); otherwise they are ranked by score and sliced. A disabled
+        or failing cross-encoder falls back to vector-search order (no dedup).
 
         Args:
             question: Search query (already rewritten, in chat mode).
@@ -1233,12 +1384,21 @@ class RAGPipeline:
         table = self._prepare()
         query_vector = embed_query(question)
         candidates = table.search(query_vector).limit(RERANK_CANDIDATES).to_list()
+        scores = _cross_encoder_scores(question, candidates)
+        if scores is None:
+            return candidates[:top_k]  # reranker disabled/unavailable -> vector order
+        # Collapse duplicate copies of the same work BEFORE selection (and before
+        # the non-diverse slice below), so dedup applies on every path. Needs the
+        # scores, to keep the higher-scored copy of each work; with the reranker
+        # unavailable (above) the vector order is returned undeduped.
+        if TITLE_DEDUP:
+            candidates, scores = _canonicalize_by_title(
+                candidates, scores, TITLE_DEDUP_YEAR_WINDOW
+            )
         if SELECT_DIVERSE:
-            scores = _cross_encoder_scores(question, candidates)
-            if scores is not None:
-                return select_diverse(candidates, scores, top_k)
-            return candidates[:top_k]  # reranker unavailable -> vector order
-        return rerank(question, candidates, top_k)
+            return select_diverse(candidates, scores, top_k)
+        ranked = sorted(zip(candidates, scores), key=lambda pair: pair[1], reverse=True)
+        return [hit for hit, _ in ranked[:top_k]]
 
     def _build_context(self, hits: list[dict]) -> tuple[str, str]:
         """Format retrieved chunks into a context block and a source list.
@@ -1546,8 +1706,149 @@ class RAGPipeline:
             history.append({"role": "user", "content": user})
             history.append({"role": "assistant", "content": answer})
 
-    def stats(self) -> str:
-        """Return a summary of the active config and all embedder tables."""
+    @staticmethod
+    def _duplicate_title_groups(
+        rows: list[dict], year_window: int | None
+    ) -> list[dict]:
+        """Group rows by normalized title and cluster duplicate copies by year.
+
+        Reuses :func:`_normalize_title` (the canonicalizer's title key) and
+        :func:`_years_compatible` (its year-window predicate) so the audit mirrors
+        what :func:`_canonicalize_by_title` would do, rather than reimplementing
+        either. Only titles shared by more than one distinct ``doc_id`` are kept.
+
+        Within each such title, the distinct copies are partitioned into
+        sub-clusters by the SAME greedy year test the canonicalizer applies: a copy
+        joins the first existing sub-cluster whose anchor (first member's) year is
+        compatible (see :func:`_years_compatible`), else it starts a new one. One
+        sub-cluster means the copies would collapse to a single work; more than one
+        means they would be treated as distinct.
+
+        NOTE: the live canonicalizer processes copies in descending query-score
+        order, which this audit cannot know, so it clusters in a deterministic
+        ``(year, doc_id)`` order instead. The verdict is therefore indicative --
+        order can change greedy clustering when years chain across the window -- not
+        a guarantee for any single query.
+
+        Args:
+            rows: Chunk rows, each with ``doc_id``, ``title`` and ``year`` keys.
+            year_window: Max year difference for two same-title copies to count as
+                one work; ``None`` matches on the normalized title alone.
+
+        Returns:
+            One dict per duplicated title, each with ``title`` (display title of the
+            first occurrence), ``members`` (``(doc_id, year)`` pairs, year an int or
+            ``None``) and ``clusters`` (the sub-clusters, each a list of members).
+        """
+        members_by_key: dict[str, dict[str, int | None]] = defaultdict(dict)
+        display: dict[str, str] = {}
+        for row in rows:
+            key = _normalize_title(row["title"])
+            if not key:  # untitled -> not title-matchable; mirrors the canonicalizer
+                continue
+            display.setdefault(key, row["title"])  # first occurrence's title
+            # First year seen per doc_id (year is per-document, so stable).
+            members_by_key[key].setdefault(row["doc_id"], _title_year(row.get("year", "")))
+
+        groups: list[dict] = []
+        for key, members_map in members_by_key.items():
+            if len(members_map) < 2:
+                continue
+            # Deterministic order (present years ascending, missing last; then
+            # doc_id) so the greedy clustering below is reproducible across runs.
+            members = sorted(
+                members_map.items(), key=lambda m: (m[1] is None, m[1] or 0, m[0])
+            )
+            clusters: list[list[tuple[str, int | None]]] = []
+            for doc_id, year in members:
+                anchor = next(
+                    (c for c in clusters if _years_compatible(year, c[0][1], year_window)),
+                    None,
+                )
+                if anchor is None:
+                    clusters.append([(doc_id, year)])
+                else:
+                    anchor.append((doc_id, year))
+            groups.append({"title": display[key], "members": members, "clusters": clusters})
+        return groups
+
+    def _format_duplicate_audit(self, table) -> list[str]:
+        """Render the duplicate-title audit lines for one embedder table.
+
+        Reads only ``(doc_id, title, year)`` -- projecting columns avoids pulling
+        vectors -- groups them via :meth:`_duplicate_title_groups`, and annotates
+        each duplicated title with the verdict :func:`_canonicalize_by_title` would
+        reach: ``would merge`` (one sub-cluster -> collapsed to one work),
+        ``kept separate`` (every sub-cluster a singleton -> all distinct), or
+        ``mixed`` (some sub-clusters merge, others stay separate; reported per
+        sub-cluster). ``would merge`` groups are the ones to eyeball -- distinct
+        papers that share a title and close years would be silently collapsed --
+        so they sort first; ``kept separate`` confirms the year window is working.
+        With ``TITLE_DEDUP`` off, the flat same-title list is shown instead, since
+        no canonicalization runs at query time.
+
+        Args:
+            table: An open LanceDB table for one embedder.
+
+        Returns:
+            Indented report lines (header + entries) to append to the stats output.
+        """
+        rows = table.to_lance().to_table(columns=["doc_id", "title", "year"]).to_pylist()
+        groups = self._duplicate_title_groups(rows, TITLE_DEDUP_YEAR_WINDOW)
+
+        if not TITLE_DEDUP:
+            lines = ["    Duplicate titles (TITLE_DEDUP off -- no query-time merge):"]
+            if not groups:
+                lines.append("      none")
+                return lines
+            for g in sorted(groups, key=lambda g: (-len(g["members"]), g["title"])):
+                lines.append(f"      {len(g['members'])}x  {g['title']}")
+            return lines
+
+        window = (
+            "title only" if TITLE_DEDUP_YEAR_WINDOW is None
+            else f"TITLE_DEDUP_YEAR_WINDOW={TITLE_DEDUP_YEAR_WINDOW}"
+        )
+        lines = [f"    Duplicate titles (vs {window}):"]
+        if not groups:
+            lines.append("      none")
+            return lines
+
+        def label_of(group: dict) -> str:
+            clusters = group["clusters"]
+            if len(clusters) == 1:
+                return "would merge"
+            if all(len(c) == 1 for c in clusters):
+                return "kept separate"
+            return "mixed"
+
+        def years_str(members: list[tuple[str, int | None]]) -> str:
+            return ", ".join(str(y) if y is not None else "?" for _, y in members)
+
+        labelled = [(label_of(g), g) for g in groups]
+        # "would merge" first (the false-merge candidates to eyeball), then by count.
+        labelled.sort(key=lambda e: (e[0] != "would merge", -len(e[1]["members"]), e[1]["title"]))
+        for label, g in labelled:
+            count = len(g["members"])
+            if label == "mixed":
+                lines.append(f"      {label:<13} {count}x  {g['title']}")
+                for cluster in g["clusters"]:
+                    verb = "merge" if len(cluster) > 1 else "separate"
+                    lines.append(f"          - {len(cluster)}x {verb} ({years_str(cluster)})")
+            else:
+                lines.append(f"      {label:<13} {count}x  {g['title']}  ({years_str(g['members'])})")
+        return lines
+
+    def stats(self, show_duplicates: bool = False) -> str:
+        """Return a summary of the active config and all embedder tables.
+
+        Args:
+            show_duplicates: When True, append a per-table duplicate-title audit
+                (same normalized title under multiple ``doc_id``s), annotated with
+                the verdict :func:`_canonicalize_by_title` would reach for each
+                group (see :meth:`_format_duplicate_audit`). The default stats
+                output omits it.
+        """
         registry = self._reconcile_registry()
         active = embedder_id()
         gen = {
@@ -1561,12 +1862,15 @@ class RAGPipeline:
             f"Embedder tables (cap {MAX_EMBEDDER_TABLES}):",
         ]
         for tid in sorted(self._embedder_ids()):
-            n = self.db.open_table(self._table_name(tid)).count_rows()
+            table = self.db.open_table(self._table_name(tid))
+            n = table.count_rows()
             docs = len(self._load_manifest(tid))
             ts = registry.get(tid)
             when = datetime.fromtimestamp(ts).isoformat(timespec="seconds") if ts else "?"
             mark = "  <- active" if tid == active else ""
             lines.append(f"  {tid}: {docs} docs, {n} chunks, last_used {when}{mark}")
+            if show_duplicates:
+                lines.extend(self._format_duplicate_audit(table))
         return "\n".join(lines)
 
 
@@ -1589,7 +1893,12 @@ def main(argv: list[str] | None = None) -> int:
     q.add_argument("question")
     q.add_argument("--top-k", type=int, default=TOP_K)
     sub.add_parser("chat", help="Interactive conversation with memory.")
-    sub.add_parser("stats", help="Show config and index statistics.")
+    st = sub.add_parser("stats", help="Show config and index statistics.")
+    st.add_argument(
+        "--duplicates",
+        action="store_true",
+        help="Also audit duplicate titles (same title, multiple doc_ids).",
+    )
     ko = sub.add_parser("keep-only", help="Drop all embedder tables except one.")
     ko.add_argument("embedder_id", nargs="?", default=None, help="Defaults to the active embedder.")
     ko.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
@@ -1606,7 +1915,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "chat":
         pipeline.chat()
     elif args.command == "stats":
-        print(pipeline.stats())
+        print(pipeline.stats(args.duplicates))
     elif args.command == "keep-only":
         pipeline.keep_only(args.embedder_id, args.yes)
     elif args.command == "rebuild":

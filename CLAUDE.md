@@ -24,7 +24,7 @@ ollama pull qwen3-embedding:0.6b      # default embedder; Ollama must be running
 python zotero_rag.py ingest                       # index new PDFs for the active embedder
 python zotero_rag.py query "your question" --top-k 6
 python zotero_rag.py chat                          # interactive, history-aware
-python zotero_rag.py stats                         # active config + per-table row/doc counts
+python zotero_rag.py stats [--duplicates]          # config + per-table counts; --duplicates: title-dup audit w/ merge/keep verdict (default omits)
 python zotero_rag.py keep-only [embedder-id] --yes # collapse to one embedder table
 python zotero_rag.py rebuild --yes                 # drop active table + manifest, re-ingest fresh
 ```
@@ -83,11 +83,18 @@ corrupts the index or crashes the embedding runner.
   `_hard_split`, and `split_oversized_records` is the final net enforcing `MAX_EMBED_CHARS`. Don't
   loosen these without understanding the crash they prevent.
 
-- **Diversity-aware retrieval.** Candidates are cross-encoder scored ONCE via `_cross_encoder_scores`
-  (shared by `rerank` and the diverse path). With `SELECT_DIVERSE`, `select_diverse` runs greedy MMR
-  with redundancy penalised only WITHIN the same `doc_id` (cross-document corroboration is not
-  penalised) plus a soft `PER_DOC_CAP` two-pass fill. A disabled or failed reranker falls back to
-  vector-search order in every path.
+- **Diversity-aware retrieval.** `retrieve` cross-encoder scores all candidates ONCE via
+  `_cross_encoder_scores`. With `TITLE_DEDUP`, `_canonicalize_by_title` then runs (after scoring,
+  before selection): processing candidates in DESCENDING score order, it keeps one `doc_id` per work
+  — anchoring each by (normalized title within `TITLE_DEDUP_YEAR_WINDOW` years) and dropping the
+  lower-scored other copies of that same title/year. **The descending-score order is load-bearing**:
+  the first copy seen anchors the work, so the wrong order would keep the worse copy. This is what
+  catches the duplicates Zotero misses — same title, different DOI, which Zotero's DOI-mismatch veto
+  leaves unmerged. Different normalized titles are NEVER merged, so cross-paper corroboration is
+  preserved. With `SELECT_DIVERSE`, `select_diverse` then runs greedy MMR with redundancy penalised
+  only WITHIN the same `doc_id` (cross-document corroboration is not penalised) plus a soft
+  `PER_DOC_CAP` two-pass fill; otherwise the survivors are ranked by score and sliced. A disabled or
+  failed reranker falls back to vector-search order (no dedup) in every path.
 
 - **Idempotent, crash-safe ingest.** Records use deterministic ids (prose `<doc_id>:c<n>`, tables
   `<doc_id>:<page>:t<tidx>:<sidx>`) and are

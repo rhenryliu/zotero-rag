@@ -28,7 +28,7 @@ The pipeline runs in seven stages:
 3. **Chunking** — overlapping, paragraph-aware chunks (~350 tokens) packed *across* page breaks, so an idea that straddles a page boundary stays in one chunk. Each chunk records its page span, so citations point at a single page (`p.N`) or a range (`pp.N-M`).
 4. **Embedding** — chunks become vectors via a selectable Ollama embedding model.
 5. **Storage** — LanceDB, with **one table per embedder** (vectors from different models aren't comparable), keyed by model + dimension.
-6. **Retrieval** — embed the query, pull the 24 nearest chunks, and score them all with a cross-encoder. Selection is **diversity-aware** by default (MMR): it trades relevance against redundancy *within the same paper* and applies a soft per-paper cap, so a single document can't dominate the context — while passages from *different* papers can still corroborate one another. Set `SELECT_DIVERSE=False` for plain top-k rerank ordering.
+6. **Retrieval** — embed the query, pull the 24 nearest chunks, and score them all with a cross-encoder. Duplicate copies of the same work — same title under different DOIs, which Zotero often leaves unmerged — are then collapsed to a single source, so a paper indexed twice doesn't crowd out other papers (`TITLE_DEDUP`; audit them with `stats --duplicates`). Selection is **diversity-aware** by default (MMR): it trades relevance against redundancy *within the same paper* and applies a soft per-paper cap, so a single document can't dominate the context — while passages from *different* papers can still corroborate one another. Set `SELECT_DIVERSE=False` for plain top-k rerank ordering.
 7. **Generation** — a grounded answer with inline `[n]` citations, via Ollama or a remote provider. With `MULTIMODAL` enabled, the retrieved pages are rendered and attached so a vision model can read figures and tables directly.
 
 Two query modes are available: a one-shot `query` with no memory, and a conversational `chat` with history-aware query rewriting.
@@ -153,8 +153,14 @@ python zotero_rag.py chat
 Show the active configuration and every embedder table on disk (document count, chunk count, last-used time), plus the table cap.
 
 ```bash
-python zotero_rag.py stats
+python zotero_rag.py stats [--duplicates]
 ```
+
+| Option | Default | Description |
+|---|---|---|
+| `--duplicates` | off | Audit duplicate library entries (same title under multiple `doc_id`s) per table. |
+
+`--duplicates` flags titles ingested twice (e.g. preprint/published pairs) and labels each with what the query-time deduplicator (`TITLE_DEDUP`) would do: **`would merge`** (within `TITLE_DEDUP_YEAR_WINDOW` years — the rows to eyeball for wrong-merges), **`kept separate`** (years too far apart), or **`mixed`**. The verdict is indicative (the live order varies per query). Default `stats` omits the audit.
 
 ### `keep-only`
 
@@ -200,6 +206,8 @@ Most knobs live in the config block near the top of `zotero_rag.py` (figure dete
 | `SELECT_DIVERSE` | `True` | Diversity-aware final selection (MMR) over the scored candidates. `False` = plain top-k rerank order. |
 | `MMR_LAMBDA` | `0.7` | Relevance vs within-paper redundancy trade-off (`1.0` = pure relevance). |
 | `PER_DOC_CAP` | `3` | Soft cap on chunks selected from any one paper. |
+| `TITLE_DEDUP` | `True` | Collapse duplicate copies of one work (same title, different DOI — which Zotero leaves unmerged) at query time, keeping the highest-scored copy. No re-ingest; audit with `stats --duplicates`. |
+| `TITLE_DEDUP_YEAR_WINDOW` | `1` | Max year gap for two same-title copies to count as one work; `None` matches on the normalized title alone. |
 | `GEN_PROVIDER` | `ollama` | `ollama` (local) \| `anthropic` (Claude API) \| `cborg` (LBNL gateway). |
 | `GEN_MODEL` | `qwen3.6:35b` | Ollama generation model. For `MULTIMODAL` it must be vision-capable and non-MLX (e.g. `gemma4:26b`). |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Used when `GEN_PROVIDER="anthropic"`. |
