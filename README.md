@@ -96,7 +96,7 @@ ollama pull gemma4:26b            # vision-capable model, only if you enable MUL
 
 The default reranker `BAAI/bge-reranker-v2-m3` (0.6B params, ~1.1 GB in fp16) downloads from HuggingFace the first time you run a query or chat. The `gte` and `qwen3` reranker alternatives download on demand if selected.
 
-> **Verify the embedder tag.** `qwen3-embedding:0.6b` is the configured default, but the exact Ollama registry tag can vary. If the pull 404s, find the correct tag and update the `ollama_model` field in the `EMBEDDERS` dict at the top of the script.
+> **Verify the embedder tag.** `qwen3-embedding:0.6b` is the configured default, but the exact Ollama registry tag can vary. If the pull 404s, find the correct tag and update the `ollama_model` field in the `EMBEDDERS` dict in `rag/config.py`.
 
 ## Quick start
 
@@ -191,7 +191,7 @@ python zotero_rag.py rebuild [--yes]
 
 ## Configuration
 
-Most knobs live in the config block near the top of `zotero_rag.py` (figure detection is tuned in `figure_filter.py` — see the note below the table). The most important ones:
+Most knobs live in `rag/config.py` (including the figure-detection tunables — see the note below the table). The most important ones:
 
 | Setting | Default | Options / notes |
 |---|---|---|
@@ -223,7 +223,7 @@ Most knobs live in the config block near the top of `zotero_rag.py` (figure dete
 | `ZOTERO_DIR` | `~/Zotero` | Zotero data directory. |
 | `INDEX_DIR` | `~/.cache/zotero_rag` | Vector index, manifests, and registry. |
 
-A few **figure-detection** tunables live at the top of `figure_filter.py` instead: `FIGURE_MIN_AREA_FRAC` (the area gate that separates figures from display equations), `FIGURE_PAD` (region inflation, in points), and `FIGURE_GRANULARITY` (`"line"` drops only in-figure lines, protecting captions that share a text block with plot annotations; `"block"` drops whole blocks).
+A few **figure-detection** tunables also live in `rag/config.py` (consumed by `rag/figure_filter.py`): `FIGURE_MIN_AREA_FRAC` (the area gate that separates figures from display equations), `FIGURE_PAD` (region inflation, in points), and `FIGURE_GRANULARITY` (`"line"` drops only in-figure lines, protecting captions that share a text block with plot annotations; `"block"` drops whole blocks).
 
 ## Generation providers
 

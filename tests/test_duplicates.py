@@ -2,7 +2,8 @@ import collections, numpy as np
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from zotero_rag import RAGPipeline, embed_query
+from rag.pipeline import RAGPipeline
+from rag.embedding import embed_query
 
 p = RAGPipeline()
 table = p._prepare()

@@ -12,17 +12,10 @@ sizeable fraction of the page); a display equation is a small vector cluster
 well below that threshold, so it is never classified as a figure and its text
 survives untouched.
 
-Integration:
-    In ``extract_pages``, replace
-        text = page.get_text("text")
-    with
-        text = extract_page_text(page, extra_regions=table_rects)
-    where ``table_rects`` are the bounding boxes of tables already rendered to
-    Markdown (so tabular text is dropped from the prose in favour of that
-    rendering). Everything downstream (paragraph-aware chunking on blank-line
-    breaks, the separate ``find_tables()`` path) is unchanged: reading order and
-    paragraph spacing match ``get_text("text")`` because dict blocks are
-    returned in the same reading order.
+The figure-detection tunables (``FIGURE_MIN_AREA_FRAC``, ``FIGURE_PAD``,
+``FIGURE_GRANULARITY``) live in :mod:`rag.config` with the rest of the
+pipeline's configuration; they are imported here and used as the default
+argument values, so a single edit in ``config.py`` retunes detection.
 
 Requires PyMuPDF >= 1.24 for ``cluster_drawings()``; older versions degrade
 gracefully to raster-image regions only.
@@ -34,10 +27,7 @@ from collections.abc import Sequence
 
 import fitz  # PyMuPDF
 
-# Figure-detection tunables (module level so they can be overridden per call).
-FIGURE_MIN_AREA_FRAC = 0.03  # figure-vs-equation area gate (tunable)
-FIGURE_PAD = 14.0            # region inflation in points
-FIGURE_GRANULARITY = "line"  # "line" | "block"
+from .config import FIGURE_GRANULARITY, FIGURE_MIN_AREA_FRAC, FIGURE_PAD
 
 
 def _figure_regions(

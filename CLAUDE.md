@@ -4,12 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A local RAG pipeline over a Zotero library, split across two modules: `zotero_rag.py` (the
-pipeline) and `figure_filter.py` (figure-aware page-text extraction, imported by the pipeline).
-Flow: discover PDFs → extract (figure-aware) → chunk across pages → embed → store in LanceDB →
-retrieve → rerank / diversity-select → generate a cited answer. Everything runs locally by
-default via Ollama; only the *generation* step can optionally be routed to a remote
-Claude-compatible API. There is a `README.md`; no package and no test suite.
+A local RAG pipeline over a Zotero library, organized as a `rag/` package with a thin
+`zotero_rag.py` launcher (so `python zotero_rag.py <command>` still works). Flow: discover PDFs →
+extract (figure-aware) → chunk across pages → embed → store in LanceDB → retrieve →
+rerank / diversity-select → generate a cited answer. Everything runs locally by default via
+Ollama; only the *generation* step can optionally be routed to a remote Claude-compatible API.
+
+Package layout (`rag/`): `config.py` (all tunables), `library.py` (Zotero discovery/metadata),
+`extraction.py` + `figure_filter.py` (PDF → figure-aware page text + tables, page images),
+`chunking.py` (chunking + size guards), `embedding.py` (embedder identity + Ollama embedding),
+`schema.py` (dynamic LanceDB model), `reranking.py` (cross-encoder), `selection.py` (MMR +
+title canonicalization), `generation.py` (provider fan-out), `pipeline.py` (`RAGPipeline`:
+LanceDB lifecycle + query path), `cli.py` (argparse). There is a `README.md` and ad-hoc test
+scripts under `tests/`; no pytest suite.
 
 ## Environment & commands
 
@@ -34,9 +41,8 @@ type hints on all functions (the global conventions apply).
 
 ## Configuration model
 
-Almost all tuning is done by editing the constants in the `=== Configuration ===` block at the top
-of `zotero_rag.py` — there are no config files or env-based settings flags. The intended workflow is
-literally a one-line edit:
+Almost all tuning is done by editing the constants in `rag/config.py` — there are no config files or
+env-based settings flags. The intended workflow is literally a one-line edit:
 
 - `EMBEDDER` — selects from the `EMBEDDERS` dict. **Switching re-ingests** into that embedder's own table.
 - `RERANKER` — selects from `RERANKERS`. Switching needs **no** re-ingest.
@@ -48,8 +54,8 @@ literally a one-line edit:
 Secrets come from the environment, not code: `ANTHROPIC_API_KEY` for `anthropic`, `CBORG_API_KEY`
 for `cborg`.
 
-Figure-detection tunables (`FIGURE_MIN_AREA_FRAC`, `FIGURE_PAD`, `FIGURE_GRANULARITY`) live at the
-top of `figure_filter.py`, not in `zotero_rag.py`.
+Figure-detection tunables (`FIGURE_MIN_AREA_FRAC`, `FIGURE_PAD`, `FIGURE_GRANULARITY`) live in
+`rag/config.py` alongside the other tunables and are consumed by `rag/figure_filter.py`.
 
 ## Architecture invariants (read before editing)
 
@@ -65,7 +71,7 @@ corrupts the index or crashes the embedding runner.
   prefix **only** for instruction-aware (Qwen) embedders. Vectors are truncated to `effective_dim()`
   and L2-normalised, so plain L2 search ranks identically to cosine (no metric is set at search time).
 
-- **Figure-aware extraction, table de-dup.** Prose comes from `figure_filter.extract_page_text`,
+- **Figure-aware extraction, table de-dup.** Prose comes from `rag.figure_filter.extract_page_text`,
   which drops text whose centre lies inside a large graphic region (area-gated by
   `FIGURE_MIN_AREA_FRAC`, so display equations survive) or inside a detected table's bbox.
   `extract_pages` calls `find_tables()` ONCE per page and feeds the result to BOTH the Markdown
@@ -112,7 +118,8 @@ corrupts the index or crashes the embedding runner.
 - **Zotero is read-only.** `zotero.sqlite` is opened `mode=ro&immutable=1` so the pipeline works
   while Zotero is running. Metadata lookup is best-effort: any failure falls back to the PDF filename.
 
-- **Provider fan-out.** Three separate generation paths. `anthropic` uses the Anthropic SDK
+- **Provider fan-out.** Three separate generation paths, all in `rag/generation.py` behind the
+  `generate()` dispatcher. `anthropic` uses the Anthropic SDK
   (`_generate_anthropic`, Messages API). `cborg` (LBNL gateway) is an **OpenAI-compatible LiteLLM
   proxy**, so it uses the **OpenAI SDK** (`_generate_openai`, `chat.completions`) with a bearer token and
   custom `base_url`, and provider-prefixed model aliases (`anthropic/claude-sonnet`) — it is *not*
