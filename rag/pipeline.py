@@ -26,7 +26,6 @@ from .config import (
     CBORG_MODEL,
     CHUNK_CHARS,
     GEN_MODEL,
-    GEN_NUM_CTX,
     GEN_PROVIDER,
     INDEX_DIR,
     MAX_EMBEDDER_TABLES,
@@ -36,6 +35,7 @@ from .config import (
     RERANKER,
     RERANKERS,
     REWRITE_MODEL,
+    REWRITE_NUM_CTX,
     SELECT_DIVERSE,
     TITLE_DEDUP,
     TITLE_DEDUP_YEAR_WINDOW,
@@ -539,7 +539,7 @@ class RAGPipeline:
                 model=REWRITE_MODEL,
                 messages=[{"role": "user", "content": instruction}],
                 think=False,
-                options={"temperature": 0.0, "num_ctx": GEN_NUM_CTX},
+                options={"temperature": 0.0, "num_ctx": REWRITE_NUM_CTX},
             )
             text = resp.message.content if hasattr(resp, "message") else resp["message"]["content"]
             return (text or "").strip().strip('"') or question

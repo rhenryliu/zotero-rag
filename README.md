@@ -136,7 +136,7 @@ python zotero_rag.py query "your question" [--top-k N]
 | Option | Default | Description |
 |---|---|---|
 | `question` | — | The question (positional, quote it). |
-| `--top-k` | `6` | Number of selected chunks used as context. |
+| `--top-k` | `8` | Number of selected chunks used as context. |
 
 If no index exists yet for the active embedder, it ingests first automatically.
 

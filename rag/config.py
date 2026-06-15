@@ -84,8 +84,8 @@ RERANKER = "bge"  # <-- one-line A/B switch: "bge" | "gte" | "qwen3"
 
 USE_RERANKER = True
 RERANK_DEVICE = "mps"  # falls back to CPU automatically if MPS load fails
-RERANK_CANDIDATES = 24  # wide first-stage recall, before reranking
-TOP_K = 6               # final chunks passed to the generator
+RERANK_CANDIDATES = 32  # wide first-stage recall, before reranking
+TOP_K = 8               # final chunks passed to the generator
 
 # Diversity-aware final selection. When on (and a cross-encoder is available),
 # ALL candidates are scored once and select_diverse trades relevance against
@@ -110,10 +110,14 @@ TITLE_DEDUP = True
 TITLE_DEDUP_YEAR_WINDOW = 1  # None = match on normalized title alone
 
 # Generation backend.
-GEN_PROVIDER = "ollama"  # "ollama" (local) | "anthropic" (Claude API) | "cborg" (LBNL gateway)
+GEN_PROVIDER = "cborg"  # "ollama" (local) | "anthropic" (Claude API) | "cborg" (LBNL gateway)
 GEN_MODEL = "qwen3.6:27b"  # Ollama model. For MULTIMODAL must be vision + NON-MLX.
+# Context window (tokens) for the local Ollama GENERATION call. Must fit the
+# system prompt + TOP_K source chunks + chat history + question; Ollama defaults
+# to a small 2048 window unless overridden, so this is set wide. Ignored by the
+# anthropic/cborg providers (they use their own *_MAX_TOKENS budgets).
 GEN_NUM_CTX = 8192
-GEN_TEMPERATURE = 0.2
+GEN_TEMPERATURE = 0.2  # answer sampling; small but non-zero for fluent prose
 ANTHROPIC_MODEL = "claude-sonnet-4-6"  # used only when GEN_PROVIDER == "anthropic"
 ANTHROPIC_MAX_TOKENS = 2048            # ANTHROPIC_API_KEY must be set in the env
 
@@ -131,7 +135,13 @@ CBORG_BASE_URL = "https://api.cborg.lbl.gov"
 # Chat-mode query rewriting always runs locally via Ollama (small, bounded task),
 # regardless of GEN_PROVIDER. Change this to taste.
 REWRITE_MODEL = "qwen3.5:9b"
-MAX_HISTORY_MESSAGES = 6
+# Context window (tokens) for the rewrite call. The rewriter only sees the chat
+# history + a short instruction (NOT the source chunks), so it needs far less
+# than GEN_NUM_CTX; sized just above worst-case history so its KV cache isn't
+# oversized. The rewriter is a different model from GEN_MODEL, so a distinct
+# num_ctx costs no extra model reload.
+REWRITE_NUM_CTX = 4096
+MAX_HISTORY_MESSAGES = 6  # chat turns (user+assistant) kept for rewrite & generation
 
 # Multimodal generation (attach rendered page images). OFF by default; retrieval
 # stays text-based regardless.
