@@ -251,7 +251,7 @@ export CBORG_API_KEY="..."
 
 Cborg is an OpenAI-compatible [LiteLLM](https://litellm.ai) proxy, so the script talks to it with the OpenAI SDK (`chat.completions`) against `https://api.cborg.lbl.gov`. Model names are provider-prefixed Cborg aliases — the default is `anthropic/claude-sonnet` (`CBORG_MODEL`); query your account's model list to see what else is available. The `openai` package is required for this provider (imported lazily, only when `GEN_PROVIDER="cborg"`).
 
-> **Multimodal over Cborg is unverified.** Cborg's handling of image content is untested. With `MULTIMODAL` enabled the script attaches OpenAI-style `image_url` blocks and prints a warning to stderr, but the request may fail or silently drop the images.
+> **Multimodal over Cborg works for vision models.** With `MULTIMODAL` enabled the script attaches OpenAI-style `image_url` blocks, which LiteLLM transcodes into the backend model's native image format. This is verified to reach the default `anthropic/claude-sonnet` (`tests/probe_cborg_multimodal.py` confirms the model reads an in-image-only canary and the prompt-token count rises accordingly). Images only land if `CBORG_MODEL` is vision-capable — a text-only alias silently drops them — so the script prints a reminder to stderr noting the active model. Re-run the probe after changing `CBORG_MODEL` to confirm.
 
 ## Storage layout
 
