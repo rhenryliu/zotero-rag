@@ -145,7 +145,7 @@ MAX_HISTORY_MESSAGES = 6  # chat turns (user+assistant) kept for rewrite & gener
 
 # Multimodal generation (attach rendered page images). OFF by default; retrieval
 # stays text-based regardless.
-MULTIMODAL = False
+MULTIMODAL = True
 IMAGE_DPI = 150
 MAX_IMAGES = 3
 

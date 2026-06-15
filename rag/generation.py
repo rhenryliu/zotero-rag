@@ -49,9 +49,12 @@ def generate(system: str, prompt: str, images: list[bytes], history) -> str:
     """
     if GEN_PROVIDER == "anthropic":
         return _generate_anthropic(system, prompt, images, history)
-    if GEN_PROVIDER == "cborg":
+    elif GEN_PROVIDER == "cborg":
         return _generate_cborg(system, prompt, images, history)
-    return _generate_ollama(system, prompt, images, history)
+    elif GEN_PROVIDER == "ollama":
+        return _generate_ollama(system, prompt, images, history)
+    else:
+        raise ValueError(f"Unsupported GEN_PROVIDER: {GEN_PROVIDER}")
 
 
 def _generate_ollama(system: str, prompt: str, images: list[bytes], history) -> str:
@@ -169,12 +172,15 @@ def _generate_cborg(system: str, prompt: str, images: list[bytes], history) -> s
             "GEN_PROVIDER='cborg' but $CBORG_API_KEY is not set in the environment."
         )
     if images:
-        # CBORG's handling of image content is unverified; warn loudly rather
-        # than fail silently if MULTIMODAL is routed through this provider.
+        # CBORG (LiteLLM) transcodes OpenAI image_url parts into Anthropic image
+        # blocks, verified to reach vision models like anthropic/claude-sonnet
+        # (see tests/probe_cborg_multimodal.py). A text-only CBORG_MODEL would
+        # silently drop them, so flag that the images only land if the model is
+        # vision-capable rather than claiming blanket failure.
         print(
-            "WARNING: MULTIMODAL is on with GEN_PROVIDER='cborg', but CBORG's "
-            "support for image content is UNVERIFIED -- this request may fail or "
-            "silently ignore the attached page images.",
+            f"NOTE: MULTIMODAL is on with GEN_PROVIDER='cborg'; attached page "
+            f"images are only used if CBORG_MODEL ('{CBORG_MODEL}') is "
+            f"vision-capable.",
             file=sys.stderr,
         )
     client = openai.OpenAI(api_key=token, base_url=CBORG_BASE_URL)
