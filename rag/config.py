@@ -146,6 +146,7 @@ GEN_MODEL = "qwen3.6:27b"  # Ollama model. For MULTIMODAL must be vision + NON-M
 # system prompt + TOP_K source chunks + chat history + question; Ollama defaults
 # to a small 2048 window unless overridden, so this is set wide. Ignored by the
 # anthropic/cborg providers (they use their own *_MAX_TOKENS budgets).
+# GEN_NUM_CTX = 16384 # Needed for multimodal input on Ollama with the penalty of speed
 GEN_NUM_CTX = 8192
 GEN_TEMPERATURE = 0.2  # answer sampling; small but non-zero for fluent prose
 ANTHROPIC_MODEL = "claude-sonnet-4-6"  # used only when GEN_PROVIDER == "anthropic"
@@ -175,7 +176,7 @@ MAX_HISTORY_MESSAGES = 6  # chat turns (user+assistant) kept for rewrite & gener
 
 # Multimodal generation (attach rendered page images). OFF by default; retrieval
 # stays text-based regardless.
-MULTIMODAL = True
+MULTIMODAL = False
 IMAGE_DPI = 150
 MAX_IMAGES = 3
 
